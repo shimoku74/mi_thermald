@@ -1,0 +1,356 @@
+=====================================================================
+ CUSTOM THERMAL ENGINE (Rust) for POCO X5 Pro / OnePlus PLK110 (redwood)
+ Unified guide v2.2 — data captured from a real device
+=====================================================================
+
+WHAT THIS IS NOW
+----------------
+This repo (mi_thermald) hosts a custom thermal engine written in Rust,
+forked from a Xiaomi daemon port and adapted to your platform. It does
+NOT use Xiaomi's encrypted configs (they don't match on this device
+anyway: "Config id 1144 does not match"), and instead self-discovers
+the hardware through standard sysfs.
+
+CRITICAL PRINCIPLE (conclusion from backup analysis):
+  Do NOT delete mi_thermald. It owns:
+    - /sys/class/thermal/thermal_message/* (sconfig, balance_mode,
+      charger_temp, temp_state, modem_limit, wifi_limit, ...)
+    - FCC — charging current (constant_charge_current, 11A default)
+    - HBM — /sys/class/drm/card0-DSI-1/thermal_hbm_disabled
+    - modem/wifi/flash limits
+  The new engine stops mi_thermald, but its files and configs stay as
+  a safety net and rollback path. Our engine is responsible for:
+    - CPU (all clusters, scaling_max_freq)
+    - GPU (cooling device thermal-devfreq-0)
+    - battery protection (temperature -> charging current, own algorithm)
+  With our engine active, FCC/HBM/modem control partially moves to it
+  (charging), the rest stays untouched — this is safe.
+
+--------------------------------------------------------------------
+ 1. REAL DEVICE DATA (from your dumps)
+--------------------------------------------------------------------
+  Model:        OnePlus PLK110 (OOS port on POCO X5 Pro)
+  Board:        redwood
+  SoC:          SM7325 (Snapdragon 778G), kernel platform lahaina
+  Android:      17, kernel 5.4
+  Root:         yes (Magisk/KernelSU — "KernelSU" present in dmesg)
+
+  CPU (cores 0-3 = Cortex-A55), real maximums:
+    little (eff):  1804800 kHz
+    mid (A78):     2400000 kHz
+    prime (A78):   2400000 kHz
+    (kernel DVFS table: 2400000 / 2380800 / 2208000 / 2035200 ...)
+
+  GPU: devfreq 3D, steps 315 / 450 / 550 MHz,
+       controlled via cooling_device "thermal-devfreq-0" (not kgsl directly)
+
+  Xiaomi channels (thermald-devices.conf), left to mi_thermald:
+    gpu=thermal-devfreq-0, battery=cooling "battery",
+    backlight=panel0-backlight, FCC=constant_charge_current (11A),
+    HBM=/sys/class/drm/card0-DSI-1/thermal_hbm_disabled,
+    modem_ul=modem_pa, modem_dl=modem_tj,
+    thermal_message: temp_state, modem_limit, market_download_limit,
+                     wifi_limit, poor_modem_limit
+
+  Sensors: pa_therm0/1, wifi_therm, msm-skin-therm, modem-*,
+           video-usr, usb, vbat, pm7325b/8350 tz and others (Qualcomm;
+           names match what the engine looks for: cpu-* / tsens-*)
+
+  Stock mi_thermald startup: init.mi_thermald.rc
+    service mi_thermald /system/vendor/bin/mi_thermald
+    seclabel u:r:mi_thermald:s0   (starts at boot and while charging)
+
+--------------------------------------------------------------------
+ 2. WHAT CHANGED IN THE CODE (v2)
+--------------------------------------------------------------------
+  1) DYNAMIC CPU CLUSTER DISCOVERY
+     The hardcoded policy0/3/7 and frequencies (2016/2803/3014 MHz) are
+     GONE. At startup it iterates /sys/devices/system/cpu/cpufreq/policy*,
+     reads cpuinfo_max_freq/min_freq, sorts clusters little->big and maps
+     them onto three atomic slots. The code now works with your real
+     1804800/2400000/2400000 and with any other SoC layout.
+     Files: src/main.rs (CpuPolicy/CPU_POLICIES/ensure_cpu_policies),
+     src/ai/native.rs, src/ai/features.rs, src/web.rs.
+
+  2) GPU CHANNEL
+     GPU control added via cooling device "thermal-devfreq-0" (exactly
+     like stock mi_thermald does): the channel is found by type,
+     state 0 = full GPU, max_state = most cooling (lowest GPU freq).
+     Group Thermal — throttles the GPU from temperature.
+     File: src/ai/native.rs.
+
+  3) AUTO-FALLBACK TO AI-NATIVE
+     If OEM configs are missing/mismatched, the engine no longer dies
+     with "no thermal config — exiting", it switches to self-discovery
+     of channels instead. File: src/main.rs.
+
+  4) MODE VIA PROPERTIES
+     The mode can be forced with a settable property:
+       setprop persist.vendor.mi_thermal_ai true   (AI-native)
+       setprop persist.vendor.mi_thermal_ai false  (classic)
+     (ro.vendor.mi_thermal_ai is also read first.) File: src/main.rs.
+
+  5) ANDROID BUILD FIXED
+     The NDK linker was moved from Cargo.toml (where it didn't work)
+     into .cargo/config.toml with the real path:
+       /home/shimoku/android-ndk/android-ndk-r27c/.../aarch64-linux-android30-clang
+
+  NOT TOUCHED (intentionally):
+    - action.rs conflict resolution (shutdown_policy0 etc.) — simply
+      not used on redwood, only logs a warning;
+    - the debug web panel (web.rs, enabled with persist.mithermal.debug=1,
+      serves temps/freqs on localhost — same as the port).
+
+--------------------------------------------------------------------
+ 3. BUILD
+--------------------------------------------------------------------
+  On PC/WSL (toolchain already set up):
+    cargo build                                         # quick check (Linux)
+    cargo build --release --target aarch64-linux-android
+  Result: target/aarch64-linux-android/release/mi_thermald
+  (~960 KB, ELF aarch64, Android 30+, stripped).
+
+--------------------------------------------------------------------
+ 4. DEPLOY (manual, no helper script)
+--------------------------------------------------------------------
+  The deploy_redwood.sh helper is intentionally not shipped anymore —
+  the commands below are the equivalent, run on the device with root
+  via adb (your platform-tools: C:\Users\shimoku\Downloads\platform-tools).
+
+  a) Push the binary:
+     cd C:\Users\shimoku\Downloads\platform-tools
+     adb push <path to>/mi_thermald /data/local/tmp/
+     adb shell su -c "chmod 755 /data/local/tmp/mi_thermald"
+
+  b) TEST (does not touch mi_thermald, ~20 s, watch the logs):
+     adb shell su -c "sh -c 'setprop persist.vendor.mi_thermal_ai true; /data/local/tmp/mi_thermald &'"
+     adb shell su -c "sleep 20; logcat -d -s thermald"
+     You should see: cluster discovery (policy0/4/7,
+     max=1804800/2400000/2400000), GPU channel thermal-devfreq-0,
+     no errors. Kill the test instance afterwards:
+     adb shell su -c "killall mi_thermald"
+
+  c) INSTALL (replace binary + backup + rollback):
+     adb shell su -c "sh -c '
+       if [ ! -f /data/vendor/thermal/mi_thermald.backup ]; then
+         cp -a /system/vendor/bin/mi_thermald /data/vendor/thermal/mi_thermald.backup
+       fi
+       stop mi_thermald
+       setprop persist.vendor.mi_thermal_ai true
+       mount -o rw,remount /system 2>/dev/null || mount -o rw,remount /
+       cp /data/local/tmp/mi_thermald /system/vendor/bin/mi_thermald
+       chmod 755 /system/vendor/bin/mi_thermald
+       restorecon /system/vendor/bin/mi_thermald 2>/dev/null || chcon u:object_r:mi_thermald_exec:s0 /system/vendor/bin/mi_thermald
+       start mi_thermald
+     '"
+     If /system is read-only (erofs) — you need overlayfs via KernelSU
+     (ksud overlayfs enable + reboot) or a patched image.
+
+  d) RESTORE at any time:
+     adb shell su -c "sh -c '
+       stop mi_thermald
+       setprop persist.vendor.mi_thermal_ai false
+       cp -a /data/vendor/thermal/mi_thermald.backup /system/vendor/bin/mi_thermald
+       restorecon /system/vendor/bin/mi_thermald 2>/dev/null || chcon u:object_r:mi_thermald_exec:s0 /system/vendor/bin/mi_thermald
+       start mi_thermald
+     '"
+
+  Check after install:
+     adb shell su -c "logcat -s thermald"     # look for discovery lines
+     adb shell su -c "cat /sys/devices/system/cpu/cpufreq/policy*/scaling_max_freq"
+     # should NOT be max values, but the ones the engine currently holds
+
+--------------------------------------------------------------------
+ 5. SMOOTHNESS / BATTERY TUNING (recommendations)
+--------------------------------------------------------------------
+  The engine runs Q-learning (AI-native). Right after install give it
+  time to settle — the first ~15 ticks it is conservative (BOOT_MAX_ACTION 4),
+  then it ramps frequencies under load. Typical behavior: at idle it
+  keeps cluster frequencies high (no thermal reason to cut), and it
+  eases down smoothly when things heat up. See README.md (State Space /
+  Reward sections) — that's also how to read the dumps.
+
+  TUNING v2.1 — SMOOTHNESS + BATTERY (added after the first few days of
+  use, following a jank complaint and a wish for more battery life):
+
+  a) GPU CHANNEL FIXED (main source of jank)
+     Previously action 9 (max performance) on the GPU channel
+     thermal-devfreq-0 mapped to cur_state = max_state = maximum
+     COOLING = minimum GPU frequency. The engine "wanted smoothness"
+     but actually choked the GPU down to 315 MHz. Now 9 -> cur_state 0
+     (full GPU 550 MHz), 0 -> max_state (cooling).
+     File: src/ai/native.rs (action_to_channel_value, "gpu" branch).
+
+  b) Q-LEARNING EXPLORATION REDUCED (epsilon 0.3 -> 0.12, min 0.05 -> 0.02)
+     Random exploration actions = random frequency drops = micro-stutter.
+     The tables are already trained; noise is only needed to track slow
+     thermal drift. File: src/ai/qtable.rs.
+
+  c) DETERMINISTIC WORKLOAD POLICIES (on top of Q-learning)
+     Caps for battery, floors for smoothness:
+       Compute (CPU):  Idle  -> action <= 4 (up to ~61% clock)
+                       Light -> 5..7 (75-85%)
+                       Moderate -> 6..9 (no hard cap)
+                       Gaming/PerfGaming/Benchmark -> 9 (full)
+       Thermal (GPU):  Idle  -> <= 3, Light 5..7, Moderate 6..9, Gaming 9
+     i.e. at idle the CPU/GPU don't rev for nothing (battery), and under
+     active use you get the full boost (smoothness). On heavy load both
+     CPU and GPU are forced to 9 (previously CPU only). The battery
+     temperature ladder ALWAYS outranks these policies.
+     File: src/ai/native.rs ("Deterministic workload policy" block).
+
+  d) SCREEN OFF = INSTANT IDLE (background savings)
+     Previously screen_on was hardcoded to 1.0 — the engine never knew
+     the screen went off and kept full caps in the background. Now the
+     screen state is read from the actual brightness (brightness > 0);
+     on screen-off the mode instantly becomes Idle, on screen-on it
+     instantly leaves Idle (the 10 s hysteresis is skipped, otherwise
+     the first 10 seconds after wake were capped at 61% = jank).
+     Files: src/ai/native.rs, src/ai/workload.rs, src/ai/features.rs.
+
+  e) ENERGY EFFICIENCY IN THE REWARD
+     Penalty for high actions under low load (W_EFF=0.8) — the agent
+     learns to relax frequencies at idle instead of holding max.
+     File: src/ai/rewards.rs.
+
+  f) FAST PERFORMANCE AFTER BOOT
+     Post-boot grace cut 90 -> 30 ticks: ~45 seconds after power-on the
+     phone can already go full throttle (was ~2 minutes of conservative
+     mode).
+
+  TUNING v2.2 — EVEN MORE BATTERY + EVEN MORE SMOOTHNESS (added for
+  sleep/background):
+
+  g) SCREEN OFF = HARD CAPS (biggest idle-battery win)
+     Previously the screen-off caps were the same as screen-on Idle:
+     CPU up to ~61% clock, GPU up to ~40%. Nothing renders now — only
+     background/audio need headroom. With screen_off the engines ALWAYS
+     applies (regardless of detected workload, even right after a game):
+       Compute (CPU): action <= 2  (~45% of HW max)
+       Thermal (GPU): action <= 1  (GPU at its floor)
+     Plus for screen-on Idle: CPU <= 3 (was 4).
+     File: src/ai/native.rs ("Screen-off ceilings" block).
+
+  h) DOWNWARD ACTION SMOOTHING (-2 per tick, down only)
+     Q-learning could drop the cap from 9 to 2 in a single tick — an
+     instant frequency cliff under load = jank. Now downward changes are
+     limited to 2 steps per second; upward moves stay instant (smoothness
+     is not hurt). Safety-forced actions (safe=false) and the battery
+     ladder are NOT smoothed — thermal protection fires immediately.
+     Side benefit: kills 9<->2 tick-to-tick oscillation (less battery
+     waste from frequency thrashing). File: src/ai/native.rs.
+
+  i) FAST EXIT FROM GAMING MODE
+     high_load_ticks decays twice as fast (4/tick instead of 2): after
+     the load ends, Gaming ceilings (9,9) used to linger ~15 seconds —
+     now ~7-8. Less wasted heat and battery. File: src/ai/workload.rs.
+
+  j) EPSILON 0.12 -> 0.08
+     Even fewer random frequency dropouts (micro-stutter) — the tables
+     are already trained. File: src/ai/qtable.rs.
+
+  VERDICT: GPU is no longer choked (smoothness), idle gets reduced caps
+  + instant Idle with the screen off (battery). Expected effect:
+  +smoothness in games/UI, +0.5-1.5 h of screen time per charge at rest.
+
+  Useful verification (stats over 2-3 days):
+    - games: watch scaling_cur_freq + fps; above 40°C the engine cuts
+      earlier than stock and smoother (we have hysteresis + stability
+      in the reward);
+    - battery: 6 h+ of screen is achievable thanks to the idle cluster
+      (A55 at 1804.8 barely sips power), the battery ladder and the
+      temperature derivative in charge protection.
+
+  ENGINE UPDATE (if v2.0 is already installed): re-running the install
+  is safe — the backup of the original mi_thermald is NOT overwritten
+  (existence check), only the binary is refreshed. Actions:
+    adb push target/aarch64-linux-android/release/mi_thermald /data/local/tmp/
+    adb shell su -c "sh -c 'stop mi_thermald; cp /data/local/tmp/mi_thermald /system/vendor/bin/mi_thermald; chmod 755 /system/vendor/bin/mi_thermald; restorecon /system/vendor/bin/mi_thermald; start mi_thermald'"
+
+--------------------------------------------------------------------
+ 6. PROPERTIES FOR CONTROL VIA `setprop` (no rebuild)
+--------------------------------------------------------------------
+   All properties are read at daemon start. Changing them on the fly is
+   not possible — a restart is needed (stop/start mi_thermald).
+
+   Device / platform:
+     setprop persist.sys.oosexgang.mi-thermald.device redwood
+       Board name (redwood, renoir, lisa …). Shown on the web panel
+       and in the log. If unset — takes ro.soc.model.
+     setprop persist.sys.oosexgang.mi-thermald.platform sm7325
+       SoC / platform name. Log + web panel.
+
+   AI mode:
+     setprop persist.sys.oosexgang.mi-thermald.ai.mode native
+       native  — Q-learning controller only, OEM configs are not read
+                 (default on redwood).
+       engine  — traditional thermal map + Q-learning as an augment
+                 (for debugging).
+       hybrid  — traditional map AND Q-learning at the same time.
+       (without the property — falls back to persist.vendor.mi_thermal_ai)
+
+   Scenario:
+     setprop persist.sys.oosexgang.mi-thermald.scenario 2
+       Force Q-table #2 from the very first tick
+       (useful to pin a known-good profile without rebuilding).
+
+   Battery:
+     setprop persist.sys.oosexgang.mi-thermald.battery.saver true
+       Enables hard frequency ceilings even in Light: CPU ≤60%,
+       GPU ≤50%. Gives +0.5-1.5 h of screen time in exchange for
+       lower peak responsiveness.
+
+   Workload (testing):
+     setprop persist.sys.oosexgang.mi-thermald.workload gaming
+       Force the engine to assume the workload is gaming (idle /
+       light / moderate / gaming / perfgaming / benchmark).
+       Useful for profiling without running a real benchmark
+       for 30+ seconds.
+
+   Logging:
+     setprop persist.sys.oosexgang.mi-thermald.log.level 6
+       Log level 0..7 (0=emerg, 7=debug). Default INFO.
+       Overrides the -l startup flag.
+
+   Q-tables:
+     setprop persist.sys.oosexgang.mi-thermald.qtable.reset 1
+       On next start it deletes /data/vendor/thermal/ai_data
+       and starts learning from scratch. The property self-clears to 0.
+
+   Full set for POCO X5 Pro:
+     setprop persist.sys.oosexgang.mi-thermald.device redwood
+     setprop persist.sys.oosexgang.mi-thermald.platform sm7325
+     setprop persist.sys.oosexgang.mi-thermald.ai.mode native
+     setprop persist.sys.oosexgang.mi-thermald.scenario 0
+     setprop persist.sys.oosexgang.mi-thermald.battery.saver false
+
+--------------------------------------------------------------------
+ 7. SAFETY / KNOWN LIMITATIONS
+--------------------------------------------------------------------
+  * Do NOT delete /system/vendor/bin/mi_thermald and init.mi_thermald.rc —
+    they are the safety net for FCC/HBM/modem/wifi and the rollback path.
+  * Do NOT touch the kernel thermal_zone trip points (emergency
+    protection) — the engine does not write them.
+  * Thermal HAL reboot loop (system_server can't find
+    android.hardware.thermal-service.qti) — a firmware/vendor issue,
+    NOT our engine: that binary is not present in /vendor/bin/hw/ on the
+    device. If the system boot-loops before loading — fix the vendor
+    first (flash an image from ROM_WORKDIR, where thermal-service.qti
+    exists), then install the engine.
+  * Before installing, back up vendor (TWRP or fastboot dump) — the
+    engine gives you a rollback, but extra insurance doesn't hurt.
+  * Do the first test with charging off and in a cool room (as in that
+    port's tests: 30-35°C ambient).
+
+--------------------------------------------------------------------
+ 8. FILES IN THE REPO
+--------------------------------------------------------------------
+  src/main.rs        — cluster discovery, main loop, fallback mode
+  src/ai/native.rs   — channels: CPU (dynamic), GPU (thermal-devfreq-0),
+                       battery/charging protection, safety
+  src/ai/features.rs, src/ai/rewards.rs, src/ai/qtable.rs — AI (32 features)
+  src/web.rs         — web panel (localhost), enable persist.mithermal.debug=1
+  .cargo/config.toml — NDK r27c linker for aarch64-linux-android
+=====================================================================
+ END OF GUIDE v2.2
+=====================================================================
