@@ -14,12 +14,13 @@ mod thermal_profile;
 mod web;
 
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use std::ffi::CString;
 use std::fs;
 use std::os::unix::io::RawFd;
+use std::process::Command;
 
 use libc;
 
@@ -122,9 +123,93 @@ pub fn is_debug_enabled() -> bool {
 static G_TERM: AtomicBool = AtomicBool::new(false);
 static G_USR1: AtomicBool = AtomicBool::new(false);
 pub(crate) static FCC_VALUE: AtomicI32 = AtomicI32::new(0);
+// The CPU_FREQ*_TARGET atomics act as *cluster slots* (0=little, 1=mid,
+// 2=big). The sysfs policy index for each slot is discovered at runtime
+// (see CPU_POLICIES below), so the same binary works on any SoC layout —
+// e.g. redwood/SM7325 (policies 0/4/7, maxes 1804800/2400000/2400000),
+// SM8250 (0/3/7), single-cluster x86, etc. The writer thread maps each
+// discovered policy to its slot's atomic and enforces it every 50 ms.
 pub(crate) static CPU_FREQ0_TARGET: AtomicI32 = AtomicI32::new(0);
 pub(crate) static CPU_FREQ3_TARGET: AtomicI32 = AtomicI32::new(0);
 pub(crate) static CPU_FREQ7_TARGET: AtomicI32 = AtomicI32::new(0);
+
+/// One discovered cpufreq policy (CPU cluster), sorted little→big by hw max.
+#[derive(Clone)]
+pub(crate) struct CpuPolicy {
+    /// sysfs policy index, e.g. 0 / 4 / 7 on redwood.
+    pub index: i32,
+    /// Full path of the scaling_max_freq node for this cluster.
+    pub path: String,
+    /// Hardware max frequency (cpuinfo_max_freq), kHz.
+    pub hw_max: i32,
+    /// Hardware min frequency (cpuinfo_min_freq), kHz.
+    pub hw_min: i32,
+    /// Cluster slot: 0 = little, 1 = mid, 2 = big → CPU_FREQ{0,3,7}_TARGET.
+    pub slot: usize,
+}
+
+pub(crate) static CPU_POLICIES: OnceLock<Vec<CpuPolicy>> = OnceLock::new();
+
+/// Enumerate every cpufreq policy present in sysfs once at startup.
+/// No hardcoded policy indices or frequencies.
+pub(crate) fn ensure_cpu_policies() {
+    let _ = CPU_POLICIES.get_or_init(|| {
+        let mut policies: Vec<CpuPolicy> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir("/sys/devices/system/cpu/cpufreq") {
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                let Some(index) = name.strip_prefix("policy").and_then(|s| s.parse::<i32>().ok())
+                else { continue };
+                let base = format!("/sys/devices/system/cpu/cpufreq/{}", name);
+                let hw_max = crate::sensor::sysfs::read_int(&format!("{}/cpuinfo_max_freq", base));
+                if hw_max <= 0 {
+                    continue;
+                }
+                let hw_min = crate::sensor::sysfs::read_int(&format!("{}/cpuinfo_min_freq", base));
+                policies.push(CpuPolicy {
+                    index,
+                    path: format!("{}/scaling_max_freq", base),
+                    hw_max,
+                    hw_min: if hw_min > 0 { hw_min } else { hw_max * 3 / 10 },
+                    slot: 0,
+                });
+            }
+        }
+        policies.sort_by_key(|p| p.hw_max);
+        for (slot, p) in policies.iter_mut().enumerate() {
+            p.slot = slot;
+        }
+        log_info!("CPU: discovered {} cpufreq clusters", policies.len());
+        for p in &policies {
+            log_info!("  policy{} slot={} max={} kHz min={} kHz",
+                p.index, p.slot, p.hw_max, p.hw_min);
+        }
+        policies
+    });
+}
+
+pub(crate) fn cpu_policies() -> &'static [CpuPolicy] {
+    ensure_cpu_policies();
+    CPU_POLICIES.get().map(|v| v.as_slice()).unwrap_or(&[])
+}
+
+/// Map a cluster slot to its target atomic (used by the 50ms writer thread).
+pub(crate) fn cpu_target_atomic(slot: usize) -> &'static AtomicI32 {
+    match slot {
+        0 => &CPU_FREQ0_TARGET,
+        1 => &CPU_FREQ3_TARGET,
+        2 => &CPU_FREQ7_TARGET,
+        _ => &CPU_FREQ7_TARGET,
+    }
+}
+
+/// Find the target atomic for a discovered policy by its sysfs index.
+pub(crate) fn cpu_target_for_policy(index: i32) -> Option<&'static AtomicI32> {
+    cpu_policies()
+        .iter()
+        .find(|p| p.index == index)
+        .map(|p| cpu_target_atomic(p.slot))
+}
 
 extern "C" fn signal_term(_: libc::c_int) {
     G_TERM.store(true, Ordering::SeqCst);
@@ -264,40 +349,106 @@ impl Engine {
 
         self.setup_signals();
 
+        // Discover CPU clusters from sysfs once, before any policy/boot-cap
+        // write or the NativeController's channel discovery.
+        ensure_cpu_policies();
+
         let soc = property_get_str(MI_PROP_SOC_MODEL, "default");
         log_info!("thermald start soc={}", soc);
 
-        let ai_prop = property_get_str("ro.vendor.mi_thermal_ai", "false");
-        let ai_enabled = ai_prop == "true" || ai_prop == "1";
+        // Log verbosity override from persist.* (higher priority
+        // than the -l command-line flag; applied before openlog
+        // so it takes effect immediately).
+        if let Ok(lv) = property_get_str(
+            crate::types::MI_PROP_MI_THERMALD_LOG_LEVEL, "")
+            .trim().parse::<i32>()
+        {
+            if (0..=7).contains(&lv) {
+                log_level = lv.clamp(0, 7);
+            }
+        }
+        // Forced scenario index — pins the Q-table profile at
+        // startup without rebuilding. Read once here.
+        if let Ok(sc) = property_get_str(
+            crate::types::MI_PROP_MI_THERMALD_SCENARIO, "")
+            .trim().parse::<i32>()
+        {
+            self.current_scenario_idx = sc.max(0);
+            log_info!("thermald: forced scenario {}", self.current_scenario_idx);
+        }
+        // Q-table reset: delete persisted JSON files so the
+        // daemon starts learning from scratch on the next run.
+        // Read once and clear the property.
+        if property_get_str(
+            crate::types::MI_PROP_MI_THERMALD_QTABLE_RESET, "")
+            .trim() == "1"
+        {
+            let _ = std::fs::remove_dir_all("/data/vendor/thermal/ai_data");
+            let _ = std::fs::create_dir_all("/data/vendor/thermal/ai_data");
+            // Clear the property so it doesn't wipe the tables
+            // on every restart.
+            let _ = Command::new("setprop")
+                .arg(crate::types::MI_PROP_MI_THERMALD_QTABLE_RESET)
+                .arg("0")
+                .output();
+            log_info!("thermald: Q-tables reset");
+        }
+
+        let ai_prop = {
+            // The persist.sys.oosexgang.mi-thermald.ai.mode
+            // property is the highest-priority override.
+            let mode = property_get_str(
+                crate::types::MI_PROP_MI_THERMALD_AI_MODE, "");
+            if !mode.is_empty() {
+                mode
+            } else {
+                let p = property_get_str("ro.vendor.mi_thermal_ai", "false");
+                if p == "false" {
+                    property_get_str("persist.vendor.mi_thermal_ai", "false")
+                } else {
+                    p
+                }
+            }
+        };
+        let ai_enabled = ai_prop == "true" || ai_prop == "1" || ai_prop == "hybrid";
         let ai_engine_enabled = ai_prop == "engine";
+        let ai_hybrid = ai_prop == "hybrid";
 
-        if ai_enabled {
+        if ai_enabled && !ai_hybrid {
+            // Pure AI-native: skip OEM thermal configs entirely,
+            // self-discover everything from sysfs.
             log_info!("AI-native mode: skipping OEM config, discovering hardware");
-
             EngineDiscovery::sensor_init(&mut self.sensors);
-
             let mut nc = ai::NativeController::new();
             nc.switch_scenario(self.current_scenario_idx);
             let n_channels = nc.channels.len();
             self.native_controller = Some(nc);
-
             log_info!("AI-native started ({} sensors, {} cooling channels)",
                 self.sensors.len(), n_channels);
         } else {
+            // Traditional map, possibly augmented by the AI engine
+            // (ai_engine_enabled) and/or running alongside the native
+            // Q-learning controller (ai_hybrid).
             if self.load_thermal_map_impl(&soc) != 0 {
-                log_err!("no thermal config — exiting");
-                return -1;
+                // No matching OEM thermal config (e.g. a port/OnePlus board
+                // without Xiaomi encrypted scenarios, or missing /vendor
+                // configs). Rather than dead-exiting, fall back to the
+                // self-discovering AI-native controller — it needs nothing
+                // but standard sysfs nodes (thermal zones, cpufreq, devfreq).
+                log_warn!("no matching OEM thermal config — switching to AI-native discovery");
+                EngineDiscovery::sensor_init(&mut self.sensors);
+                let mut nc = ai::NativeController::new();
+                nc.switch_scenario(self.current_scenario_idx);
+                let n_channels = nc.channels.len();
+                self.native_controller = Some(nc);
+                log_info!("AI-native started via config fallback ({} sensors, {} cooling channels)",
+                    self.sensors.len(), n_channels);
+                return 0;
             }
             log_info!("thermald started ({} sensors, {} instances)",
                 self.sensors.len(), self.instances.len());
-
-            // Apply conservative CPU freq caps immediately at boot so the
-            // writer thread enforces them before the first thermal tick fires
-            // (~1s later). Without this, the CPU runs at hardware-max for
-            // the entire first second and temperatures spike to 90°C+.
             Self::apply_boot_freq_caps();
-
-            if ai_engine_enabled {
+            if ai_engine_enabled || ai_hybrid {
                 match ai::AIEngine::new() {
                     Ok(engine) => {
                         self.ai_engine = Some(engine);
@@ -308,6 +459,17 @@ impl Engine {
                     }
                 }
             }
+            // Hybrid mode: run the native Q-learning controller alongside
+            // the traditional map.
+            if ai_hybrid {
+                EngineDiscovery::sensor_init(&mut self.sensors);
+                let mut nc = ai::NativeController::new();
+                nc.switch_scenario(self.current_scenario_idx);
+                let n_channels = nc.channels.len();
+                self.native_controller = Some(nc);
+                log_info!("AI-native hybrid started ({} sensors, {} channels)",
+                    self.sensors.len(), n_channels);
+            }
         }
 
         0
@@ -317,19 +479,16 @@ impl Engine {
     /// The `thread_cpu_freq_writer` loop reads these atomics every 50ms,
     /// so the caps take effect well before the first thermal tick (~1s).
     fn apply_boot_freq_caps() {
-        // 60% of each cluster's max — enough for a fast boot, cool enough
-        // to avoid the 90°C+ spike that occurs when the CPU runs at full
-        // speed for the entire first second before thermal control kicks in.
-        let caps = [
-            ("/sys/devices/system/cpu/cpufreq/policy0/scaling_max_freq", 1209600, &CPU_FREQ0_TARGET),
-            ("/sys/devices/system/cpu/cpufreq/policy3/scaling_max_freq", 1681920, &CPU_FREQ3_TARGET),
-            ("/sys/devices/system/cpu/cpufreq/policy7/scaling_max_freq", 1808640, &CPU_FREQ7_TARGET),
-        ];
-        for (path, val, atomic) in &caps {
-            atomic.store(*val, Ordering::Relaxed);
-            sysfs::write_int(path, *val);
+        // 60% of each cluster's hardware max — enough for a fast boot, cool
+        // enough to avoid the 90°C+ spike that occurs when the CPU runs at
+        // full speed for the entire first second before thermal control kicks
+        // in. Values are derived from sysfs (cpuinfo_max_freq), not hardcoded.
+        for p in crate::cpu_policies() {
+            let cap = p.hw_max * 3 / 5;
+            crate::cpu_target_atomic(p.slot).store(cap, Ordering::Relaxed);
+            sysfs::write_int(&p.path, cap);
+            log_info!("boot freq cap: policy{} = {} MHz", p.index, cap / 1000);
         }
-        log_info!("boot freq caps applied: policy0=1209 policy3=1681 policy7=1808 MHz");
     }
 
     fn setup_signals(&self) {
@@ -589,17 +748,13 @@ fn thread_poll_sensors(engine: Arc<Mutex<Engine>>, shutdown: Arc<AtomicBool>) {
 }
 
 fn thread_cpu_freq_writer() {
-    let paths = [
-        (0, "/sys/devices/system/cpu/cpufreq/policy0/scaling_max_freq", &CPU_FREQ0_TARGET),
-        (3, "/sys/devices/system/cpu/cpufreq/policy3/scaling_max_freq", &CPU_FREQ3_TARGET),
-        (7, "/sys/devices/system/cpu/cpufreq/policy7/scaling_max_freq", &CPU_FREQ7_TARGET),
-    ];
+    let policies = crate::cpu_policies().to_vec();
     loop {
-        for &(_, path, target) in &paths {
+        for p in &policies {
             // FIX BUG-004: Use Acquire ordering to ensure visibility of writes
-            let val = target.load(std::sync::atomic::Ordering::Acquire);
+            let val = crate::cpu_target_atomic(p.slot).load(std::sync::atomic::Ordering::Acquire);
             if val > 0 {
-                crate::sensor::sysfs::write_int(path, val);
+                crate::sensor::sysfs::write_int(&p.path, val);
             }
         }
         thread::sleep(Duration::from_millis(50));

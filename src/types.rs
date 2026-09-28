@@ -7,6 +7,45 @@ pub const MI_THERMALD_LAST_DUMP_FILE: &str = "/data/vendor/thermal/last_thermal.
 pub const MI_THERMALD_CONFIG_DIR: &str = "/data/vendor/thermal/config";
 pub const MI_THERMALD_DECRYPT_DIR: &str = "/data/vendor/thermal/thermald_decrypt";
 
+// Board override: set via adb shell setprop persist.sys.oosexgang.mi-thermald.device redwood
+// (redwood, renoir, lisa …). The daemon reads it at startup and
+// exposes it for any device-specific behaviour / diagnostics.
+pub const MI_PROP_MI_THERMALD_DEVICE: &str =
+    "persist.sys.oosexgang.mi-thermald.device";
+// SoC family override, same mechanism.
+pub const MI_PROP_MI_THERMALD_PLATFORM: &str =
+    "persist.sys.oosexgang.mi-thermald.platform";
+// Force the AI mode: "native" (Q-learning controller), "engine"
+// (Q-learning augmenting the traditional map), "hybrid" (both),
+// "off" (traditional map only). Overrides ro.vendor.mi_thermal_ai
+// and persist.vendor.mi_thermal_ai when set.
+pub const MI_PROP_MI_THERMALD_AI_MODE: &str =
+    "persist.sys.oosexgang.mi-thermald.ai.mode";
+// Force a scenario index (0-4) for the AI-native controller at
+// startup, overriding auto-detection. Useful to pin a known-good
+// profile without rebuilding.
+pub const MI_PROP_MI_THERMALD_SCENARIO: &str =
+    "persist.sys.oosexgang.mi-thermald.scenario";
+// Battery-saver override: when "true" the daemon applies tighter
+// CPU/GPU ceilings even under Light load, at the cost of some
+// burst headroom. Useful to squeeze out extra screen-on time.
+pub const MI_PROP_MI_THERMALD_BATTERY_SAVER: &str =
+    "persist.sys.oosexgang.mi-thermald.battery.saver";
+// Force a workload mode for testing (idle / light / moderate /
+// gaming / perfgaming / benchmark). The daemon acts as if the
+// detected workload is this one on every tick. Overrides detection.
+pub const MI_PROP_MI_THERMALD_WORKLOAD: &str =
+    "persist.sys.oosexgang.mi-thermald.workload";
+// Reset the persisted Q-tables on the next start. Set to "1" or
+// "true", daemon deletes the JSON files in /data/vendor/thermal/ai_data
+// and starts learning from scratch. Read once and cleared.
+pub const MI_PROP_MI_THERMALD_QTABLE_RESET: &str =
+    "persist.sys.oosexgang.mi-thermald.qtable.reset";
+// Numeric log verbosity override (0=emerg … 7=debug), replacing
+// the -l command-line flag and the hardcoded LOG_INFO default.
+pub const MI_PROP_MI_THERMALD_LOG_LEVEL: &str =
+    "persist.sys.oosexgang.mi-thermald.log.level";
+
 pub const MI_PROP_SOC_MODEL: &str = "ro.soc.model";
 pub const MI_PROP_THERMAL_DATA_PATH: &str = "vendor.sys.thermal.data.path";
 

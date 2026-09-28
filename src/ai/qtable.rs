@@ -5,8 +5,12 @@ use super::tile_coding::TileCoding;
 const NUM_ACTIONS: u8 = 10;
 const LEARNING_RATE: f32 = 0.1;
 const DISCOUNT_FACTOR: f32 = 0.95;
-const EPSILON_START: f32 = 0.3;
-const EPSILON_MIN: f32 = 0.05;
+// Exploration is kept low on purpose: random actions directly translate into
+// random frequency drops, which the user perceives as micro-stutter. The
+// persisted tables already contain learned policies, so we only need a small
+// amount of noise to keep tracking slow thermal drift.
+const EPSILON_START: f32 = 0.12;
+const EPSILON_MIN: f32 = 0.02;
 const EPSILON_DECAY_TICKS: u64 = 604_800;
 
 #[derive(Serialize, Deserialize)]

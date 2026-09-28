@@ -332,20 +332,16 @@ impl FeatureExtractor {
     }
 
     fn read_avg_cpu_freq() -> f32 {
-        let policies = ["/sys/devices/system/cpu/cpufreq/policy0",
-                        "/sys/devices/system/cpu/cpufreq/policy3",
-                        "/sys/devices/system/cpu/cpufreq/policy7"];
+        let policies = crate::cpu_policies();
         let mut sum = 0.0f64;
         let mut count = 0;
-        for base in &policies {
+        for p in policies {
+            let base = format!("/sys/devices/system/cpu/cpufreq/policy{}", p.index);
             let cur = crate::sensor::sysfs::read_int(
                 &format!("{}/scaling_cur_freq", base)
             );
-            let max = crate::sensor::sysfs::read_int(
-                &format!("{}/cpuinfo_max_freq", base)
-            );
-            if cur > 0 && max > 0 {
-                sum += cur as f64 / max as f64;
+            if cur > 0 && p.hw_max > 0 {
+                sum += cur as f64 / p.hw_max as f64;
                 count += 1;
             }
         }

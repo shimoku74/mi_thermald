@@ -24,7 +24,9 @@ const BOOT_MAX_ACTION: u8 = 4;
 /// forces Compute action to 9) for this many additional ticks.  This avoids
 /// the cliff-edge where the boot phase ends and the still-hot CPU immediately
 /// gets pushed back to max performance, tripping the safety circuit breaker.
-const POST_BOOT_GRACE_TICKS: u64 = 90;
+/// 30 ticks keeps prolonged boot heat under control without making the phone
+/// feel sluggish for the first couple of minutes (was 90).
+const POST_BOOT_GRACE_TICKS: u64 = 30;
 
 const CHARGE_RATE_EMA_ALPHA: f32 = 0.3;
 const CHARGE_RATE_SAFE_C_PER_S: f32 = 0.03; // below this, no extra cap
@@ -156,10 +158,43 @@ pub struct NativeController {
     idle_load_ticks: u64,
     global_tick_count: u64,
     boot_tick_count: u64,
+    // Board / platform override, read from persist.* properties
+    // at startup (set via 'setprop persist.sys.oosexgang.mi-
+    // thermald.device redwood'). Used for logging and any
+    // future device-specific behaviour.
+    pub device: String,
+    pub platform: String,
+    // Battery-saver override: tighter CPU/GPU ceilings under
+    // Light load, at the cost of burst headroom.
+    battery_saver: bool,
+    // Forced workload mode: when Some, overrides the detected
+    // workload on every tick (useful for testing / profiling).
+    forced_workload: Option<WorkloadMode>,
 }
 
 impl NativeController {
     pub fn new() -> Self {
+        // Board / platform override from a settable persist.*
+        // property — lets the same binary run on redwood, renoir,
+        // lisa … without a rebuild. Falls back to the kernel's
+        // ro.soc.model when the override is absent.
+        let device = crate::property_get_str(
+            crate::types::MI_PROP_MI_THERMALD_DEVICE, "");
+        let platform = crate::property_get_str(
+            crate::types::MI_PROP_MI_THERMALD_PLATFORM, "");
+        let soc = crate::property_get_str(crate::MI_PROP_SOC_MODEL, "");
+        let device = if device.is_empty() {
+            format!("(soC {})", soc)
+        } else {
+            device
+        };
+        let platform = if platform.is_empty() {
+            "(kernel auto)".to_string()
+        } else {
+            platform
+        };
+        log_info!("AI-native: device={} platform={} soc={}",
+            device, platform, soc);
         let mut ctrl = NativeController {
             channels: Vec::new(),
             scenario_models: HashMap::new(),
@@ -178,7 +213,35 @@ impl NativeController {
             charge_max_val: 12000000,
             global_tick_count: 0,
             boot_tick_count: 0,
+            device,
+            platform,
+            battery_saver: false,
+            forced_workload: None,
         };
+        // Read the remaining persist.* overrides that belong
+        // to the controller (they were read after init_channels
+        // because log_info! is already running by now).
+        ctrl.battery_saver = crate::property_get_str(
+            crate::types::MI_PROP_MI_THERMALD_BATTERY_SAVER, "0")
+            == "1" || crate::property_get_str(
+            crate::types::MI_PROP_MI_THERMALD_BATTERY_SAVER, "0") == "true";
+        ctrl.forced_workload = match crate::property_get_str(
+            crate::types::MI_PROP_MI_THERMALD_WORKLOAD, "")
+            .to_lowercase().as_str() {
+            "idle" => Some(WorkloadMode::Idle),
+            "light" => Some(WorkloadMode::Light),
+            "moderate" => Some(WorkloadMode::Moderate),
+            "gaming" => Some(WorkloadMode::Gaming),
+            "perfgaming" => Some(WorkloadMode::PerfGaming),
+            "benchmark" => Some(WorkloadMode::Benchmark),
+            _ => None,
+        };
+        if ctrl.battery_saver {
+            log_info!("AI-native: battery-saver ON (tighter ceilings)");
+        }
+        if let Some(wm) = ctrl.forced_workload {
+            log_info!("AI-native: forced workload {:?}", wm);
+        }
         ctrl.init_channels();
         ctrl.load_persisted_tables();
         if ctrl.channels.is_empty() {
@@ -192,6 +255,17 @@ impl NativeController {
     pub fn is_enabled(&self) -> bool {
         self.enabled
     }
+
+    pub fn device(&self) -> &str {
+        &self.device
+    }
+    pub fn platform(&self) -> &str {
+        &self.platform
+    }
+    pub fn battery_saver(&self) -> bool { self.battery_saver }
+    pub fn forced_workload(&self) -> Option<WorkloadMode> { self.forced_workload }
+    pub fn set_battery_saver(&mut self, v: bool) { self.battery_saver = v; }
+    pub fn set_forced_workload(&mut self, v: Option<WorkloadMode>) { self.forced_workload = v; }
 
     pub fn disabled_reason(&self) -> Option<&str> {
         self.disabled_reason.as_deref()
@@ -304,6 +378,12 @@ impl NativeController {
             if let Some(ch) = self.channels.iter().find(|c| c.group == ChannelGroup::Display) {
                 let actual_brightness = crate::sensor::sysfs::read_int(&ch.path).max(0);
                 state.brightness_ratio = actual_brightness as f32 / ch.max_val.max(1) as f32;
+                // Real screen state: brightness > 0 means the panel is on.
+                // (feature_extractor hardcodes screen_on=1.0, so we correct
+                // it here — without this the daemon can never notice the
+                // screen is off and keeps full performance headroom in the
+                // background, wasting battery.)
+                state.screen_on = if actual_brightness > 0 { 1.0 } else { 0.0 };
             }
             if let Some(ch) = self.channels.iter().find(|c| c.name == "charge_current") {
                 state.charge_current_ratio = ch.value as f32 / ch.max_val.max(1) as f32;
@@ -325,6 +405,15 @@ impl NativeController {
                 state.temp_variance,
                 state.screen_on > 0.5,
             );
+            // Forced workload override: set via
+            // persist.sys.oosexgang.mi-thermald.workload.
+            // Useful to pin a mode for profiling without
+            // running a real benchmark for 30+ seconds.
+            let workload_mode = if let Some(wm) = self.forced_workload {
+                wm
+            } else {
+                workload_mode
+            };
 
             state.workload_mode = match workload_mode {
                 crate::ai::WorkloadMode::Idle => 0.0,
@@ -364,10 +453,50 @@ impl NativeController {
                 let mut final_action = if safe { action } else { 3u8 };
 
                 if in_boot_phase {
+                    // Boot-storm protection: keep everything conservative for
+                    // the first few ticks regardless of workload.
                     final_action = final_action.min(BOOT_MAX_ACTION);
-                } else if !in_post_boot && group == ChannelGroup::Compute {
-                    if is_heavy_load && final_action < 9 {
+                } else {
+                    if !in_post_boot && is_heavy_load && final_action < 9 {
+                        // Real sustained load / gaming: full CPU *and* full
+                        // GPU (the GPU mapping is fixed so 9 = full speed).
                         final_action = 9;
+                    }
+
+                    // Deterministic workload policy layered on top of the
+                    // learned agent. Ceilings save battery when we don't need
+                    // headroom; floors guarantee smoothness while the user is
+                    // actively driving the device. Both are skipped when the
+                    // safety layer forced a cooling action, and the
+                    // battery-temperature ladder below overrides them anyway
+                    // (thermal safety always wins).
+                    if safe {
+                        // battery-saver mode applies stricter ceilings to
+                        // squeeze out more screen-on time at the cost
+                        // of some burst headroom.
+                        let (floor_a, ceil_a) = if group == ChannelGroup::Compute {
+                            let (idle_f, idle_c) = if self.battery_saver { (0u8, 2u8) } else { (0u8, 4u8) };
+                            let (light_f, light_c) = if self.battery_saver { (3u8, 5u8) } else { (5u8, 7u8) };
+                            match workload_mode {
+                                crate::ai::WorkloadMode::Idle => (idle_f, idle_c),
+                                crate::ai::WorkloadMode::Light => (light_f, light_c),
+                                crate::ai::WorkloadMode::Moderate => (6u8, 9u8),
+                                _ => (9u8, 9u8),
+                            }
+                        } else if group == ChannelGroup::Thermal {
+                            let (idle_f, idle_c) = if self.battery_saver { (0u8, 2u8) } else { (0u8, 3u8) };
+                            let (light_f, light_c) = if self.battery_saver { (3u8, 4u8) } else { (5u8, 7u8) };
+                            match workload_mode {
+                                crate::ai::WorkloadMode::Idle => (idle_f, idle_c),
+                                crate::ai::WorkloadMode::Light => (light_f, light_c),
+                                crate::ai::WorkloadMode::Moderate => (6u8, 9u8),
+                                _ => (9u8, 9u8),
+                            }
+                        } else {
+                            (0u8, 9u8)
+                        };
+                        if final_action < floor_a { final_action = floor_a; }
+                        if final_action > ceil_a { final_action = ceil_a; }
                     }
                 }
 
@@ -524,30 +653,51 @@ impl NativeController {
             });
         }
 
-        // scaling_max_freq for each CPU cluster (direct frequency cap)
-        for &(policy, hw_max, var) in &[
-            (0, 2016000, &crate::CPU_FREQ0_TARGET),
-            (3, 2803200, &crate::CPU_FREQ3_TARGET),
-            (7, 3014400, &crate::CPU_FREQ7_TARGET),
-        ] {
-            let path = format!("/sys/devices/system/cpu/cpufreq/policy{}/scaling_max_freq", policy);
+        // scaling_max_freq for each CPU cluster (direct frequency cap).
+        // Clusters are discovered dynamically from sysfs (no hardcoded
+        // policy indices / frequencies) — redwood (SM7325) gives 0/4/7 with
+        // 1804800/2400000/2400000 kHz.
+        for p in crate::cpu_policies() {
+            let path = p.path.clone();
             if std::path::Path::new(&path).exists() {
                 let cur = crate::sensor::sysfs::read_int(&path).max(0);
-                let cur = if cur > 0 { cur } else { hw_max };
+                let cur = if cur > 0 { cur } else { p.hw_max };
                 // FIX BUG-004: Use Release ordering for cross-thread visibility
-                var.store(cur, std::sync::atomic::Ordering::Release);
+                crate::cpu_target_atomic(p.slot).store(cur, std::sync::atomic::Ordering::Release);
                 self.channels.push(CoolingChannel {
-                    name: format!("cpu_freq{}", policy),
+                    name: format!("cpu_freq{}", p.index),
                     path,
                     action_type: ActionType::CpuFreq,
                     group: ChannelGroup::Compute,
                     value: cur,
-                    min_val: hw_max * 3 / 10,
-                    max_val: hw_max,
+                    min_val: p.hw_max * 3 / 10,
+                    max_val: p.hw_max,
                     pid: None,
                     pid_state: SicState::default(),
                     sensor_name: None,
                 });
+            }
+        }
+
+        // GPU: controlled via the kernel thermal cooling device, exactly as
+        // mi_thermald does on this board (thermald-devices.conf "gpu" ->
+        // cooling_name thermal-devfreq-0). State 0 = lowest GPU frequency,
+        // max_state = full GPU. Discovered by type, no hardcoded index.
+        if let Some((dir, cur, max)) = Self::find_cooling_device("thermal-devfreq-0") {
+            if max > 0 {
+                self.channels.push(CoolingChannel {
+                    name: "gpu".into(),
+                    path: format!("{}/cur_state", dir),
+                    action_type: ActionType::None,
+                    group: ChannelGroup::Thermal,
+                    value: cur.min(max),
+                    min_val: 0,
+                    max_val: max,
+                    pid: None,
+                    pid_state: SicState::default(),
+                    sensor_name: None,
+                });
+                log_info!("AI-native: GPU channel {} (max_state={})", dir, max);
             }
         }
 
@@ -570,6 +720,25 @@ impl NativeController {
                 sensor_name: None,
             });
         }
+    }
+
+    /// Find the sysfs cooling device whose `type` matches `kind`
+    /// (e.g. "thermal-devfreq-0" for GPU). Returns (dir, cur_state, max_state).
+    fn find_cooling_device(kind: &str) -> Option<(String, i32, i32)> {
+        for i in 0..4096u32 {
+            let dir = format!("/sys/class/thermal/cooling_device{}", i);
+            if !std::path::Path::new(&dir).exists() {
+                break;
+            }
+            let t = crate::sensor::sysfs::read_string(&format!("{}/type", dir))
+                .unwrap_or_default();
+            if t.trim() == kind {
+                let cur = crate::sensor::sysfs::read_int(&format!("{}/cur_state", dir)).max(0);
+                let max = crate::sensor::sysfs::read_int(&format!("{}/max_state", dir)).max(0);
+                return Some((dir, cur, max));
+            }
+        }
+        None
     }
 
     fn enrich_from_config(&mut self) {
@@ -714,12 +883,8 @@ impl NativeController {
     }
 
     fn cpu_freq_target_var(name: &str) -> Option<&'static std::sync::atomic::AtomicI32> {
-        match name {
-            "cpu_freq0" => Some(&crate::CPU_FREQ0_TARGET),
-            "cpu_freq3" => Some(&crate::CPU_FREQ3_TARGET),
-            "cpu_freq7" => Some(&crate::CPU_FREQ7_TARGET),
-            _ => None,
-        }
+        let idx = name.strip_prefix("cpu_freq")?.parse::<i32>().ok()?;
+        crate::cpu_target_for_policy(idx)
     }
 
     fn apply_temp_based_charge(&mut self) {
@@ -818,7 +983,21 @@ impl NativeController {
     fn action_to_channel_value(action: u8, ch: &CoolingChannel) -> i32 {
         match ch.name.as_str() {
             "balance_mode" => (action as i32 * 7 / 9).min(7),
-            "boost" => 1, // always on — balance_mode handles cooling
+            "boost" => {
+                // Boost only pays off under real load. Turning it off while
+                // cooling/idle saves battery without hurting smoothness.
+                if action >= 6 { 1 } else { 0 }
+            }
+            "gpu" => {
+                // GPU cooling device semantics: cur_state 0 = GPU at FULL
+                // speed, max_state = most cooling (lowest GPU frequency).
+                // That is inverted relative to the CPU freq channels, so map
+                // action 9 (performance) -> cur_state 0 and action 0
+                // (cooling) -> max_state. Before this fix, "max performance"
+                // throttled the GPU to its minimum clock -> UI jank.
+                let range = (ch.max_val - ch.min_val).max(1);
+                super::lerp_by_action(action, ch.min_val, range, false)
+            }
             _ => {
                 if action > 9 {
                     return ch.value;

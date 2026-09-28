@@ -6,6 +6,7 @@ const W_PERF: f32 = 1.0;
 const W_BATT: f32 = 0.5;
 const W_STAB: f32 = 0.3;
 const W_BATT_TEMP: f32 = 4.0;
+const W_EFF: f32 = 0.8; // efficiency: high actions at low load are penalized
 
 pub struct RewardCalculator {
     w_temp: f32,
@@ -56,7 +57,13 @@ impl RewardCalculator {
         match group {
             crate::ai::native::ChannelGroup::Compute => {
                 let perf_reward = state.cpu_freq_ratio;
-                self.w_temp * temp_penalty + perf_weight * perf_reward - self.w_stab * stab_penalty
+                // Efficiency penalty: keeping a high cap while the load is low
+                // (and the governor would stay idle) is wasted potential; the
+                // agent learns to relax the cap instead of holding max freq.
+                // This reinforces the deterministic idle/light ceilings.
+                let load = state.cpu_load.clamp(0.0, 1.0);
+                let eff_penalty = W_EFF * (1.0 - load) * (action as f32 / 9.0);
+                self.w_temp * temp_penalty + perf_weight * perf_reward - self.w_stab * stab_penalty - eff_penalty
             }
             crate::ai::native::ChannelGroup::Thermal => {
                 self.w_temp * temp_penalty - self.w_stab * stab_penalty

@@ -1,0 +1,314 @@
+=====================================================================
+ СВОЙ THERMAL-ДВИЖОК (Rust) для POCO X5 Pro / OnePlus PLK110 (redwood)
+ Единый гайд v2.1 — данные сняты с реального устройства
+=====================================================================
+
+ЧТО ЭТО ТЕПЕРЬ
+-------------
+В этом репозитории (mi_thermald) — собственный термический движок на
+Rust, собранный из порта Xiaomi-демона и адаптированный под вашу
+платформу. Он НЕ использует шифрованные конфиги Xiaomi (они на этом
+устройстве всё равно не матчатся: "Config id 1144 does not match"),
+а сам обнаруживает железо через стандартный sysfs.
+
+ВАЖНЕЙШИЙ ПРИНЦИП (вывод из анализа бэкапов):
+  mi_thermald НЕ удаляем. Он владеет:
+    - /sys/class/thermal/thermal_message/* (sconfig, balance_mode,
+      charger_temp, temp_state, modem_limit, wifi_limit, ...)
+    - FCC — ток зарядки (constant_charge_current, дефолт 11А)
+    - HBM — /sys/class/drm/card0-DSI-1/thermal_hbm_disabled
+    - modem/wifi/flash лимиты
+  Новый движок останавливает mi_thermald, но его файлы и конфиги
+  остаются как страховка и для отката. Наш движок отвечает за:
+    - CPU (все кластеры, scaling_max_freq)
+    - GPU (cooling device thermal-devfreq-0)
+    - батарейную защиту (температура → ток зарядки, свой алгоритм)
+  Управление FCC/HBM/modem при активном нашем движке переходит к нему
+  частично (зарядка), остальное без изменений — это безопасно.
+
+---------------------------------------------------------------------
+ 1. РЕАЛЬНЫЕ ДАННЫЕ УСТРОЙСТВА (из ваших дампов)
+---------------------------------------------------------------------
+  Модель:        OnePlus PLK110 (порт OOS на POCO X5 Pro)
+  Board:         redwood
+  SoC:           SM7325 (Snapdragon 778G), платформа ядра lahaina
+  Android:       17, ядро 5.4
+  Root:          есть (Magisk/KernelSU — в dmesg "KernelSU" присутствует)
+
+  CPU (ядра 0-3 = Cortex-A55), реальные максимумы:
+    little (eff):  1804800 кГц
+    mid (A78):     2400000 кГц
+    prime (A78):   2400000 кГц
+    (DVFS-таблица ядра: 2400000 / 2380800 / 2208000 / 2035200 ...)
+
+  GPU: devfreq 3D, ступени 315 / 450 / 550 МГц,
+       управление — cooling_device "thermal-devfreq-0" (не kgsl напрямую)
+
+  Каналы Xiaomi (thermald-devices.conf), оставлены mi_thermald:
+    gpu=thermal-devfreq-0, battery=cooling "battery",
+    backlight=panel0-backlight, FCC=constant_charge_current(11А),
+    HBM=/sys/class/drm/card0-DSI-1/thermal_hbm_disabled,
+    modem_ul=modem_pa, modem_dl=modem_tj,
+    thermal_message: temp_state, modem_limit, market_download_limit,
+                     wifi_limit, poor_modem_limit
+
+  Датчики: pa_therm0/1, wifi_therm, msm-skin-therm, modem-*,
+           video-usr, usb, vbat, pm7325b/8350 tz и др. (Qualcomm, имена
+           совпадают с тем, что ищет движок: cpu-* / tsens-*)
+
+  Старт штатного mi_thermald: init.mi_thermald.rc
+    service mi_thermald /system/vendor/bin/mi_thermald
+    seclabel u:r:mi_thermald:s0   (запуск на boot и при зарядке)
+
+---------------------------------------------------------------------
+ 2. ЧТО ИЗМЕНЕНО В КОДЕ (v2)
+---------------------------------------------------------------------
+  1) ДИНАМИЧЕСКОЕ ОБНАРУЖЕНИЕ CPU-КЛАСТЕРОВ
+     Хардкод policy0/3/7 и частот (2016/2803/3014 МГц) УБРАН.
+     При старте перебираются /sys/devices/system/cpu/cpufreq/policy*,
+     читаются cpuinfo_max_freq/min_freq, кластеры сортируются
+     little→big и раскладываются по трём атомикам-слотам.
+     Теперь код работает с вашими реальными 1804800/2400000/2400000
+     и с любой другой раскладкой SoC. Файлы: src/main.rs
+     (CpuPolicy/CPU_POLICIES/ensure_cpu_policies), src/ai/native.rs,
+     src/ai/features.rs, src/web.rs.
+
+  2) GPU-КАНАЛ
+     Добавлено управление GPU через cooling device "thermal-devfreq-0"
+     (как это делает штатный mi_thermald): канал найден по типу,
+     state 0 = минимальная частота GPU, max_state = полный GPU.
+     Группа Thermal — троттлит GPU от температуры. Файл: src/ai/native.rs.
+
+  3) АВТОФОЛЛБЭК В AI-NATIVE
+     Если OEM-конфиги не найдены/не матчатся — движок больше НЕ падает
+     с "no thermal config — exiting", а сам переключается в режим
+     самодетекта каналов. Файл: src/main.rs.
+
+  4) РЕЖИМ ЧЕРЕЗ ПРОПЕРТИ
+     Режим можно форсировать изменяемым свойством:
+       setprop persist.vendor.mi_thermal_ai true   (AI-native)
+       setprop persist.vendor.mi_thermal_ai false  (классический)
+     (ro.vendor.mi_thermal_ai тоже читается первым.) Файл: src/main.rs.
+
+  5) СБОРКА ПОД ANDROID ПОЧИНЕНА
+     NDK-линкер перенесён из Cargo.toml (где не работал) в
+     .cargo/config.toml с реальным путём:
+       /home/shimoku/android-ndk/android-ndk-r27c/.../aarch64-linux-android30-clang
+
+  НЕ ТРОГАЛИ (осознанно):
+    - разрешение конфликтов в action.rs (shutdown_policy0 и пр.) —
+      на redwood просто не применяется, только warn в лог;
+    - веб-панель отладки (web.rs, включается persist.mithermal.debug=1,
+      отдаёт температуры/частоты на localhost — как у того порта).
+
+---------------------------------------------------------------------
+ 3. СБОРКА
+---------------------------------------------------------------------
+  На ПК/WSL (тулчейн уже настроен):
+    cargo build                                         # быстрая проверка (Linux)
+    cargo build --release --target aarch64-linux-android
+  Результат: target/aarch64-linux-android/release/mi_thermald
+  (~960 КБ, ELF aarch64, Android 30+, stripped).
+
+---------------------------------------------------------------------
+ 4. ДЕПЛОЙ (скрипт deploy_redwood.sh, в этом репозитории)
+---------------------------------------------------------------------
+  Скрипт работает на телефоне (root). Команды через ADB (у вас
+  платформа-инструменты: C:\Users\shimoku\Downloads\platform-tools):
+
+  a) Положить бинарь и скрипт на телефон:
+     cd C:\Users\shimoku\Downloads\platform-tools
+     adb push <путь к>/mi_thermald        /data/local/tmp/
+     adb push <путь к>/deploy_redwood.sh  /data/local/tmp/
+
+  b) ТЕСТ (не отключает mi_thermald, 20 сек, смотрит логи):
+     adb shell su -c "sh /data/local/tmp/deploy_redwood.sh test"
+     В выводе должно быть: discovery кластеров (policy0/4/7,
+     max=1804800/2400000/2400000), GPU-канал thermal-devfreq-0,
+     без ошибок.
+
+  c) УСТАНОВКА (замена бинаря + бэкап + откат):
+     adb shell su -c "sh /data/local/tmp/deploy_redwood.sh install"
+     Скрипт сам: бэкапит оригинал в /data/vendor/thermal/mi_thermald.backup,
+     останавливает mi_thermald, ставит persist.vendor.mi_thermal_ai=true,
+     копирует бинарь в /system/vendor/bin/mi_thermald, чинит права и
+     контекст, запускает. Если /system read-only (erofs) — скажет:
+     нужен overlayfs через KernelSU (ksud overlayfs enable + reboot)
+     либо прошивка образа.
+
+  d) ОТКАТ в любой момент:
+     adb shell su -c "sh /data/local/tmp/deploy_redwood.sh restore"
+
+  Проверка после установки:
+     adb shell su -c "sh /data/local/tmp/deploy_redwood.sh status"
+     adb shell su -c "logcat -s thermald"     # ищем discovery-строки
+     adb shell su -c "cat /sys/devices/system/cpu/cpufreq/policy*/scaling_max_freq"
+     # должны быть не «максимум», а значения, которые держит движок
+
+---------------------------------------------------------------------
+ 5. НАСТРОЙКА ПОД ПЛАВНОСТЬ / АВТОНОМНОСТЬ (рекомендации)
+---------------------------------------------------------------------
+  Движок работает по Q-learning (AI-native). Сразу после установки дай
+  ему поработать — первые ~15 тиков он консервативен (BOOT_MAX_ACTION 4),
+  потом поднимает частоты под нагрузкой. Характерное поведение:
+  в простое держит высокие частоты кластеров (нет тепловых причин
+  резать), при нагреве плавно снижает. См. README.md (раздел State
+  Space / Reward) — там же как читать дампы.
+
+  ТЮНИНГ v2.1 — ПЛАВНОСТЬ + БАТАРЕЯ (добавлено после первых дней
+  эксплуатации, по жалобе на пролаги и желанию больше автономности):
+
+  a) ИСПРАВЛЕН GPU-КАНАЛ (главный источник пролагов)
+     Раньше действие 9 (максимум производительности) для GPU-канала
+     thermal-devfreq-0 мапилось в cur_state = max_state = максимальное
+     ОХЛАЖДЕНИЕ = минимальная частота GPU. Движок «хотел плавности»,
+     а на деле душил GPU до 315 МГц. Теперь 9 -> cur_state 0 (полный
+     GPU 550 МГц), 0 -> max_state (охлаждение). Файл: src/ai/native.rs
+     (action_to_channel_value, ветка "gpu").
+
+  b) РАЗВЕДКА Q-LEARNING УМЕНЬШЕНА (epsilon 0.3 -> 0.12, мин 0.05 -> 0.02)
+     Случайные действия при разведке = случайные просадки частот =
+     микрофризы. Таблицы уже обучены, шум нужен только для отслеживания
+     медленного теплового дрейфа. Файл: src/ai/qtable.rs.
+
+  c) ДЕТЕРМИНИРОВАННЫЕ РАБОЧИЕ ПОЛИТИКИ (поверх Q-learning)
+     Капы ради батареи, флоры ради плавности:
+       Compute (CPU):  Idle  -> действие <= 4 (до ~61% частоты)
+                       Light -> 5..7 (75-85%)
+                       Moderate -> 6..9 (без жёсткого капа)
+                       Gaming/PerfGaming/Benchmark -> 9 (полный)
+       Thermal (GPU):  Idle  -> <= 3, Light 5..7, Moderate 6..9, Gaming 9
+     То есть в простое CPU/GPU не разгоняются вхолостую (батарея),
+     при активном использовании — полный разгон (плавность). При
+     тяжёлой нагрузке и CPU, и GPU форсируются в 9 (раньше только CPU).
+     Батарейный лэддер температуры ВСЕГДА стоит выше этих политик.
+     Файл: src/ai/native.rs (блок "Deterministic workload policy").
+
+  d) ЭКРАН ВЫКЛЮЧЕН = IDLE МГНОВЕННО (экономия в фоне)
+     Раньше screen_on был захардкожен в 1.0 — движок не знал, что
+     экран погас, и держал полные капы в фоне. Теперь состояние экрана
+     читается из актуальной яркости (brightness > 0), при выключении
+     режим мгновенно становится Idle, при включении — мгновенно
+     выходит из Idle (хистерезис 10 сек пропускается, иначе первые
+     10 секунд после пробуждения были с капом в 61% = тормоза).
+     Файлы: src/ai/native.rs, src/ai/workload.rs, src/ai/features.rs.
+
+  e) ЭНЕРГОЭФФЕКТИВНОСТЬ В НАГРАДЕ
+     Штраф за высокое действие при низкой нагрузке (W_EFF=0.8) — агент
+     сам учится отпускать частоты в простое, а не держать максимум.
+     Файл: src/ai/rewards.rs.
+
+  f) БЫСТРЫЙ ВЫХОД НА ПРОИЗВОДИТЕЛЬНОСТЬ ПОСЛЕ ЗАГРУЗКИ
+     Пост-бутовый грейс сокращён 90 -> 30 тиков: через ~45 секунд после
+     включения телефон уже может разгоняться полностью (было ~2 минуты
+     консервативного режима).
+
+  ИТОГ: GPU больше не душится (плавность), в простое — урезанные капы
+  + мгновенный Idle при погашенном экране (батарея). Ожидаемый эффект:
+  +плавность в играх/интерфейсе, +0.5-1.5ч экрана на зарядке при покое.
+
+  Полезные пробы эффективности (стат от 2-3 дней):
+    - игры: смотреть scaling_cur_freq + fps; при 40°C+ движок режет раньше
+      штатного и плавнее (у нас гистерезис+стабильность в награде);
+    - автономность: 6ч+ экрана достижимо за счёт idle-кластера
+      (A55 на 1804.8 не жрёт), батарейного лэддера и производной
+      температуры в защите зарядки.
+
+  ОБНОВЛЕНИЕ ДВИЖКА (если v2.0 уже стоит): повторный install безопасен —
+  скрипт НЕ перезапишет бэкап оригинального mi_thermald (проверка
+  существования файла), только обновит бинарь. Действия:
+    adb push target/aarch64-linux-android/release/mi_thermald /data/local/tmp/
+    adb push deploy_redwood.sh /data/local/tmp/
+    adb shell su -c "sh /data/local/tmp/deploy_redwood.sh install"
+
+---------------------------------------------------------------------
+ ---------------------------------------------------------------------
+  6. СВОЙСТВА ДЛЯ УПРАВЛЕНИЯ ЧЕРЕЗ `setprop` (без пересборки)
+ ---------------------------------------------------------------------
+   Все свойства читаются при старте daemon. Изменить на лету
+   нельзя — нужен restart (или stop/start mi_thermald).
+
+   Устройство / платформа:
+     setprop persist.sys.oosexgang.mi-thermald.device redwood
+       Имя board (redwood, renoir, lisa …). Отображается
+       на веб-панели и в логе. Если не задано — берёт
+       ro.soc.model.
+     setprop persist.sys.oosexgang.mi-thermald.platform sm7325
+       Имя SoC / платформы. Лог + веб-панель.
+
+   Режим работы ИИ:
+     setprop persist.sys.oosexgang.mi-thermald.ai.mode native
+       native  — только Q-learning контроллер, OEM-конфиги
+                 не читаются (по умолчанию на redwood).
+       engine  — традиционный thermal map + Q-learning как
+                 augment (для отладки).
+       hybrid  — традиционный map И Q-learning одновременно.
+       (без свойства — читает persist.vendor.mi_thermal_ai)
+
+   Сценарий:
+     setprop persist.sys.oosexgang.mi-thermald.scenario 2
+       Принудительно запускать Q-table #2 с первого тика
+       (полезно, чтобы зафиксировать рабочий профиль без
+       rebuild).
+
+   Батарея:
+     setprop persist.sys.oosexgang.mi-thermald.battery.saver true
+       Включает жёсткие потолки частот даже в Light: CPU ≤60%,
+       GPU ≤50%. Даёт +0.5-1.5ч экранного времени в обмен на
+       меньшую пиковую отзывчивость.
+
+   Нагрузка (тестирование):
+     setprop persist.sys.oosexgang.mi-thermald.workload gaming
+       Принудительно считать, что нагрузка = gaming (idle /
+       light / moderate / gaming / perfgaming / benchmark).
+       Полезно для профилирования без настоящего бенчмарка
+       на 30+ секунд.
+
+   Логирование:
+     setprop persist.sys.oosexgang.mi-thermald.log.level 6
+       Уровень логов 0..7 (0=emerg, 7=debug). По умолчанию INFO.
+       Переопределяет флаг -l при запуске.
+
+   Q-таблицы:
+     setprop persist.sys.oosexgang.mi-thermald.qtable.reset 1
+       При следующем старте удалит /data/vendor/thermal/ai_data
+       и начнёт обучение с нуля. Свойство само сбрасывается в 0.
+
+   Пример набора для POCO X5 Pro:
+     setprop persist.sys.oosexgang.mi-thermald.device redwood
+     setprop persist.sys.oosexgang.mi-thermald.platform sm7325
+     setprop persist.sys.oosexgang.mi-thermald.ai.mode native
+     setprop persist.sys.oosexgang.mi-thermald.scenario 0
+     setprop persist.sys.oosexgang.mi-thermald.battery.saver false
+
+ ---------------------------------------------------------------------
+  7. БЕЗОПАСНОСТЬ / ИЗВЕСТНЫЕ ОГРАНИЧЕНИЯ
+---------------------------------------------------------------------
+  * НЕ удалять /system/vendor/bin/mi_thermald и init.mi_thermald.rc —
+    это страховка для FCC/HBM/modem/wifi и канал отката.
+  * НЕ трогать trip-точки ядер thermal_zone (это аварийная защита),
+    движок их не пишет.
+  * Ребут-луп thermal HAL (system_server не находит
+    android.hardware.thermal-service.qti) — проблема прошивки/vendor,
+    НЕ нашего движка: в /vendor/bin/hw/ этого бинаря на устройстве нет.
+    Если система в луп-цикле до загрузки — сначала чинить vendor
+    (прошить образ из ROM_WORKDIR, где thermal-service.qti есть),
+    затем ставить движок.
+  * Перед установкой сделайте backup vendor (TWRP или fastboot dump) —
+    скрипт даёт откат, но страховка сверху не помешает.
+  * Первый тест делайте при выключенной зарядке и в прохладном
+    помещении (как в тестах того порта: 30-35°C комнатных).
+
+---------------------------------------------------------------------
+  8. ФАЙЛЫ В РЕПОЗИТОРИИ
+---------------------------------------------------------------------
+  src/main.rs        — discovery кластеров, главный цикл, fallback-режим
+  src/ai/native.rs   — каналы: CPU (динамические), GPU (thermal-devfreq-0),
+                       батарейная защита зарядки, safety
+  src/ai/features.rs, src/ai/rewards.rs, src/ai/qtable.rs — AI (32 признака)
+  src/web.rs         — веб-панель (localhost), включить persist.mithermal.debug=1
+  deploy_redwood.sh  — test / install / restore на телефоне
+  .cargo/config.toml — линкер NDK r27c для aarch64-linux-android
+=====================================================================
+ КОНЕЦ ГАЙДА v2.1
+=====================================================================

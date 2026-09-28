@@ -11,6 +11,10 @@ pub(crate) struct WebSnapshot {
     ts: u64,
     scenario: i32,
     mode: String,
+    device: String,
+    platform: String,
+    battery_saver: bool,
+    ai_mode: String,
     sensors: Vec<SensorInfo>,
     instances: Vec<InstanceInfo>,
     battery: BatteryInfo,
@@ -108,13 +112,10 @@ fn read_cpu_load() -> f32 {
 }
 
 fn read_cpu_freqs() -> Vec<i32> {
-    let policies = [
-        "/sys/devices/system/cpu/cpufreq/policy0",
-        "/sys/devices/system/cpu/cpufreq/policy3",
-        "/sys/devices/system/cpu/cpufreq/policy7",
-    ];
-    policies.iter().map(|base| {
-        let cur = crate::sensor::sysfs::read_int(&format!("{}/scaling_cur_freq", base));
+    crate::cpu_policies().iter().map(|p| {
+        let cur = crate::sensor::sysfs::read_int(
+            &format!("/sys/devices/system/cpu/cpufreq/policy{}/scaling_cur_freq", p.index)
+        );
         if cur > 0 { cur / 1000 } else { 0 }
     }).collect()
 }
@@ -147,6 +148,26 @@ fn read_battery_info() -> BatteryInfo {
 pub fn collect_snapshot(engine: &crate::Engine) -> WebSnapshot {
     let scenario = engine.current_scenario_idx;
     let mode = if engine.native_controller.is_some() {
+        "native"
+    } else if engine.ai_engine.is_some() {
+        "engine"
+    } else {
+        "traditional"
+    }.to_string();
+    // Device / platform / battery-saver from
+    // persist.* overrides (see main.rs init).
+    let (device, platform, battery_saver) =
+        if let Some(nc) = engine.native_controller.as_ref() {
+            (nc.device().to_string(),
+             nc.platform().to_string(),
+             nc.battery_saver())
+        } else {
+            ("?".to_string(), "?".to_string(), false)
+        };
+    // The actual AI mode the daemon is running in.
+    let ai_mode = if engine.native_controller.is_some() && engine.ai_engine.is_some() {
+        "hybrid"
+    } else if engine.native_controller.is_some() {
         "native"
     } else if engine.ai_engine.is_some() {
         "engine"
@@ -227,6 +248,10 @@ pub fn collect_snapshot(engine: &crate::Engine) -> WebSnapshot {
         cpu_freq_mhz,
         gpu_freq_mhz,
         native,
+        device,
+        platform,
+        battery_saver,
+        ai_mode,
     }
 }
 
@@ -566,7 +591,10 @@ function renderAI(d){
   const n=d.native;
   const en=n?n.enabled:(m!=='traditional');
   el.innerHTML=`
-    <div class="m"><span class="k">Mode</span><span class="v" style="color:var(--accent)">${esc(m)}</span></div>
+    <div class="m"><span class="k">Mode</span><span class="v" style="color:var(--accent)">${esc(m)}${d.battery_saver?' <span style="color:var(--orange);font-size:10px">battery-saver</span>':''}</span></div>
+    <div class="m"><span class="k">Device</span><span class="v">${esc(d.device)}</span></div>
+    <div class="m"><span class="k">Platform</span><span class="v">${esc(d.platform)}</span></div>
+    <div class="m"><span class="k">AI Mode</span><span class="v">${esc(d.ai_mode)}</span></div>
     <div class="m"><span class="k">Status</span><span class="v" style="color:${en?'var(--green)':'var(--red)'}">${en?'Active':'Disabled'}</span></div>
     <div class="m"><span class="k">Scenario</span><span class="v">${d.scenario}</span></div>
     ${n&&n.reason?`<div class="m"><span class="k">Disable Reason</span><span class="v" style="color:var(--red);font-size:11px">${esc(n.reason)}</span></div>`:''}`;
@@ -724,7 +752,7 @@ function update(d){
   renderChannels(d.native?d.native.channels:[]);
   renderInst(d.instances||[],d.mode||'');
   updateChart(d.sensors||[]);
-  $('sub').textContent=`AI: ${d.mode} \u00b7 Scenario ${d.scenario} \u00b7 ${(d.sensors||[]).length} sensors`;
+  $('sub').textContent=`${d.device} / ${d.platform} · AI: ${d.mode} · Scenario ${d.scenario} · ${(d.sensors||[]).length} sensors`;
   $('status').textContent='live';
   $('dot').className='dot';
   fc=0;

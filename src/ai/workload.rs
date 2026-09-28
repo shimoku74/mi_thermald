@@ -30,6 +30,10 @@ pub struct WorkloadDetector {
     // Detection state
     high_load_ticks: u64,
     last_mode: WorkloadMode,
+    // Tracks screen-off state so the Idle cap is released instantly on wake
+    // (otherwise 10 s of hysteresis would leave the CPU/GPU capped at 61%
+    // while the user is already interacting — perceived as jank).
+    screen_off: bool,
 
     // Hysteresis to prevent mode flapping
     ticks_in_current_mode: u64,
@@ -56,6 +60,7 @@ impl WorkloadDetector {
         WorkloadDetector {
             high_load_ticks: 0,
             last_mode: WorkloadMode::Light,
+            screen_off: false,
             ticks_in_current_mode: 0,
             mode_switch_threshold: 10,  // 10 seconds before mode switch
             profile_manager: ThermalProfileManager::new(),
@@ -114,7 +119,21 @@ impl WorkloadDetector {
         // Reset counters if screen off
         if !screen_on {
             self.high_load_ticks = 0;
+            if !self.screen_off {
+                self.screen_off = true;
+                // Drop straight to Idle: no point keeping Moderate/Gaming
+                // ceilings (or hysteresis) while the panel is off.
+                self.force_mode_update = true;
+            }
             return self.update_mode(WorkloadMode::Idle);
+        }
+
+        // Screen just turned on: jump straight to the detected mode, skipping
+        // the 10-second hysteresis. Otherwise the Idle CPU/GPU caps would
+        // linger right as the user starts interacting (jank on wake).
+        if self.screen_off {
+            self.screen_off = false;
+            self.force_mode_update = true;
         }
 
         // Detect sustained high CPU demand (frequency + load)
