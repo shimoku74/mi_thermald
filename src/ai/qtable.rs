@@ -9,7 +9,7 @@ const DISCOUNT_FACTOR: f32 = 0.95;
 // random frequency drops, which the user perceives as micro-stutter. The
 // persisted tables already contain learned policies, so we only need a small
 // amount of noise to keep tracking slow thermal drift.
-const EPSILON_START: f32 = 0.12;
+const EPSILON_START: f32 = 0.08;
 const EPSILON_MIN: f32 = 0.02;
 const EPSILON_DECAY_TICKS: u64 = 604_800;
 

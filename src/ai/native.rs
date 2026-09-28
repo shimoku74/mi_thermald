@@ -471,32 +471,72 @@ impl NativeController {
                     // battery-temperature ladder below overrides them anyway
                     // (thermal safety always wins).
                     if safe {
-                        // battery-saver mode applies stricter ceilings to
-                        // squeeze out more screen-on time at the cost
-                        // of some burst headroom.
-                        let (floor_a, ceil_a) = if group == ChannelGroup::Compute {
-                            let (idle_f, idle_c) = if self.battery_saver { (0u8, 2u8) } else { (0u8, 4u8) };
-                            let (light_f, light_c) = if self.battery_saver { (3u8, 5u8) } else { (5u8, 7u8) };
-                            match workload_mode {
-                                crate::ai::WorkloadMode::Idle => (idle_f, idle_c),
-                                crate::ai::WorkloadMode::Light => (light_f, light_c),
-                                crate::ai::WorkloadMode::Moderate => (6u8, 9u8),
-                                _ => (9u8, 9u8),
+                        // Screen-off ceilings: the panel is off, nothing
+                        // renders, so the GPU sits at its floor and the
+                        // CPUs only need enough for background/audio.
+                        // Applied regardless of the detected workload
+                        // (right after a game, during music, etc.) —
+                        // this is the single biggest idle-battery win.
+                        // battery-saver mode (screen on) applies stricter
+                        // ceilings too, at the cost of burst headroom.
+                        let screen_off = state.screen_on < 0.5;
+                        let caps = if group == ChannelGroup::Compute {
+                            if screen_off {
+                                (0u8, 2u8)
+                            } else if self.battery_saver {
+                                match workload_mode {
+                                    crate::ai::WorkloadMode::Idle => (0u8, 2u8),
+                                    crate::ai::WorkloadMode::Light => (3u8, 5u8),
+                                    crate::ai::WorkloadMode::Moderate => (6u8, 9u8),
+                                    _ => (9u8, 9u8),
+                                }
+                            } else {
+                                match workload_mode {
+                                    crate::ai::WorkloadMode::Idle => (0u8, 3u8),
+                                    crate::ai::WorkloadMode::Light => (5u8, 7u8),
+                                    crate::ai::WorkloadMode::Moderate => (6u8, 9u8),
+                                    _ => (9u8, 9u8),
+                                }
                             }
                         } else if group == ChannelGroup::Thermal {
-                            let (idle_f, idle_c) = if self.battery_saver { (0u8, 2u8) } else { (0u8, 3u8) };
-                            let (light_f, light_c) = if self.battery_saver { (3u8, 4u8) } else { (5u8, 7u8) };
-                            match workload_mode {
-                                crate::ai::WorkloadMode::Idle => (idle_f, idle_c),
-                                crate::ai::WorkloadMode::Light => (light_f, light_c),
-                                crate::ai::WorkloadMode::Moderate => (6u8, 9u8),
-                                _ => (9u8, 9u8),
+                            if screen_off {
+                                (0u8, 1u8)
+                            } else if self.battery_saver {
+                                match workload_mode {
+                                    crate::ai::WorkloadMode::Idle => (0u8, 2u8),
+                                    crate::ai::WorkloadMode::Light => (3u8, 4u8),
+                                    crate::ai::WorkloadMode::Moderate => (6u8, 9u8),
+                                    _ => (9u8, 9u8),
+                                }
+                            } else {
+                                match workload_mode {
+                                    crate::ai::WorkloadMode::Idle => (0u8, 2u8),
+                                    crate::ai::WorkloadMode::Light => (5u8, 7u8),
+                                    crate::ai::WorkloadMode::Moderate => (6u8, 9u8),
+                                    _ => (9u8, 9u8),
+                                }
                             }
                         } else {
                             (0u8, 9u8)
                         };
+                        let (floor_a, ceil_a) = caps;
                         if final_action < floor_a { final_action = floor_a; }
                         if final_action > ceil_a { final_action = ceil_a; }
+                    }
+                }
+
+                // Smooth the action downward: a sudden multi-step drop
+                // of the CPU/GPU cap under active load is what the user
+                // feels as a frequency cliff / jank. Ease drops by at
+                // most 2 steps per tick; raises stay instant so
+                // responsiveness is not hurt. Hazard-forced actions
+                // (safe == false) and the battery-temperature ladder
+                // below are NOT smoothed — thermal safety acts at once.
+                if safe {
+                    if let Some(&prev_a) = model.last_actions.get(&group) {
+                        if final_action + 2 < prev_a {
+                            final_action = prev_a - 2;
+                        }
                     }
                 }
 

@@ -144,7 +144,10 @@ impl WorkloadDetector {
         if high_cpu {
             self.high_load_ticks += 1;
         } else {
-            self.high_load_ticks = self.high_load_ticks.saturating_sub(2);
+            // Decay fast so ceilings relax promptly once the heavy
+            // phase ends (was 2: leaving Gaming took ~15 s of wasted
+            // full-speed headroom after the load had already stopped).
+            self.high_load_ticks = self.high_load_ticks.saturating_sub(4);
         }
 
         // Determine workload mode with hysteresis
