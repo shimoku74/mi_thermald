@@ -92,6 +92,38 @@ fn action_cap_for_battery_level(soc_pct: i32, voltage_uv: i32) -> u8 {
     9
 }
 
+// GPU-busy floor for smooth UI compositing (blur / "liquid glass").
+// The Adreno GPU spikes busy during a blur compositing pass (notification
+// shade, recents, translucent panels) while CPU load can still read low,
+// so the CPU-load workload classifier reads Idle/Light and the Thermal
+// ladder throttles the GPU right underneath the blur pass — exactly the
+// frame the user is looking at, so it shows up as stutter. Reading GPU
+// busy directly gives a compositing signal the CPU load misses. In true
+// idle (static screen, GPU ~0%) this never triggers, so battery is
+// unaffected; and the battery-temp / brownout caps below still clamp it,
+// so thermal safety always wins over the smoothness floor.
+const GPU_BUSY_ACTIVE_PCT: i32 = 25;
+
+fn read_gpu_busy_pct() -> i32 {
+    // Adreno exposes busy either as a ready-made percentage or as a devfreq
+    // load figure; some kernels append a "%" or trailing text, so take the
+    // leading digits only. Returns -1 when no node is present, which makes
+    // every caller a no-op (behaviour identical to before this feature).
+    const PATHS: &[&str] = &[
+        "/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage",
+        "/sys/class/kgsl/kgsl-3d0/devfreq/gpu_load",
+    ];
+    for p in PATHS {
+        if let Some(s) = crate::sensor::sysfs::read_string(p) {
+            let digits: String = s.trim().chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(v) = digits.parse::<i32>() {
+                return v.min(100);
+            }
+        }
+    }
+    -1
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ChannelGroup {
     Compute,
@@ -484,6 +516,7 @@ impl NativeController {
             let batt_voltage_uv = crate::sensor::sysfs::read_int(
                 "/sys/class/power_supply/battery/voltage_now"
             );
+            let gpu_busy = read_gpu_busy_pct();
 
             let mut group_actions = HashMap::new();
             for &group in &[ChannelGroup::Compute, ChannelGroup::Thermal, ChannelGroup::Charging, ChannelGroup::Display] {
@@ -559,7 +592,24 @@ impl NativeController {
                         } else {
                             (0u8, 9u8)
                         };
-                        let (floor_a, ceil_a) = caps;
+                        let (mut floor_a, mut ceil_a) = caps;
+
+                        // Blur/compositing smoothness floor: hold the GPU at
+                        // a healthy mid-high clock whenever it is actually
+                        // busy with the screen on, overriding the Idle/Light
+                        // ceiling that would otherwise throttle it under the
+                        // blur pass. battery-saver gets a gentler floor (user
+                        // asked to trade some smoothness for range). The GPU
+                        // lives in the Thermal group in AI-native discovery.
+                        if group == ChannelGroup::Thermal
+                            && !screen_off
+                            && gpu_busy >= GPU_BUSY_ACTIVE_PCT
+                        {
+                            let blur_floor = if self.battery_saver { 4u8 } else { 6u8 };
+                            floor_a = floor_a.max(blur_floor);
+                            ceil_a = 9;
+                        }
+
                         if final_action < floor_a { final_action = floor_a; }
                         if final_action > ceil_a { final_action = ceil_a; }
                     }
