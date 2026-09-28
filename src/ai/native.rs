@@ -58,6 +58,40 @@ fn action_for_battery_temp(workload_mode: WorkloadMode, batt_temp_c: f32) -> u8 
         .map_or(0, |&(_, action)| action)
 }
 
+// Battery-empty / brownout protection. Forcing max CPU+GPU performance
+// (action 9) while the cell is nearly empty asks for a current spike a
+// low-SoC — or already sagging — battery may not be able to supply without
+// its voltage collapsing below the hardware's undervoltage cutoff: the
+// phone freezes (starved SoC/radio brownout), then hard-powers-off despite
+// the fuel gauge still reporting real charge, and comes back up warning of
+// a critically low battery once the cell recovers under no load. Cap
+// compute/thermal actions purely as a function of remaining charge and
+// cell voltage, independent of detected workload — the same "thermal
+// safety always wins" pattern as the battery-temperature ladder above.
+const LOW_BATTERY_PCT: i32 = 15;
+const CRITICAL_BATTERY_PCT: i32 = 5;
+// A cell sags toward these well before the fuel-gauge SoC estimate catches
+// up (SoC lags actual chemistry, especially on an aged battery), so a
+// sagging rail is treated as its own early-warning signal alongside SoC.
+const BROWNOUT_VOLTAGE_UV: i32 = 3450000;
+const SEVERE_BROWNOUT_VOLTAGE_UV: i32 = 3350000;
+
+fn action_cap_for_battery_level(soc_pct: i32, voltage_uv: i32) -> u8 {
+    if voltage_uv > 0 && voltage_uv < SEVERE_BROWNOUT_VOLTAGE_UV {
+        return 1;
+    }
+    if soc_pct >= 0 && soc_pct <= CRITICAL_BATTERY_PCT {
+        return 2;
+    }
+    if voltage_uv > 0 && voltage_uv < BROWNOUT_VOLTAGE_UV {
+        return 4;
+    }
+    if soc_pct >= 0 && soc_pct <= LOW_BATTERY_PCT {
+        return 6;
+    }
+    9
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ChannelGroup {
     Compute,
@@ -444,6 +478,12 @@ impl NativeController {
                 "/sys/class/power_supply/battery/temp"
             );
             let batt_temp_c = batt_temp as f32 / 10.0;
+            let batt_soc = crate::sensor::sysfs::read_int(
+                "/sys/class/power_supply/battery/capacity"
+            );
+            let batt_voltage_uv = crate::sensor::sysfs::read_int(
+                "/sys/class/power_supply/battery/voltage_now"
+            );
 
             let mut group_actions = HashMap::new();
             for &group in &[ChannelGroup::Compute, ChannelGroup::Thermal, ChannelGroup::Charging, ChannelGroup::Display] {
@@ -546,7 +586,18 @@ impl NativeController {
                         final_action = temp_action;
                     }
                 }
-                
+
+                // Compute and Thermal are the channels that actually pull
+                // current under load (CPU/GPU); Charging is already governed
+                // by apply_temp_based_charge and Display isn't a load source,
+                // so only cap the two that matter for a brownout.
+                if matches!(group, ChannelGroup::Compute | ChannelGroup::Thermal) {
+                    let batt_level_cap = action_cap_for_battery_level(batt_soc, batt_voltage_uv);
+                    if batt_level_cap < final_action {
+                        final_action = batt_level_cap;
+                    }
+                }
+
                 group_actions.insert(group, final_action);
             }
 
