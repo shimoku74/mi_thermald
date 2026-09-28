@@ -45,6 +45,13 @@ pub const MI_PROP_MI_THERMALD_QTABLE_RESET: &str =
 // the -l command-line flag and the hardcoded LOG_INFO default.
 pub const MI_PROP_MI_THERMALD_LOG_LEVEL: &str =
     "persist.sys.oosexgang.mi-thermald.log.level";
+// Path of the periodic full-snapshot stats file. Empty string disables
+// the stats writer. Default: /data/vendor/thermal/stats.json
+pub const MI_PROP_MI_THERMALD_STATS_PATH: &str =
+    "persist.sys.oosexgang.mi-thermald.stats.path";
+// Interval in seconds between stats file dumps (0 disables). Default 60.
+pub const MI_PROP_MI_THERMALD_STATS_INTERVAL: &str =
+    "persist.sys.oosexgang.mi-thermald.stats.interval";
 
 pub const MI_PROP_SOC_MODEL: &str = "ro.soc.model";
 pub const MI_PROP_THERMAL_DATA_PATH: &str = "vendor.sys.thermal.data.path";

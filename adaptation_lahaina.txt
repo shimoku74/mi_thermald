@@ -1,6 +1,6 @@
 =====================================================================
  CUSTOM THERMAL ENGINE (Rust) for POCO X5 Pro / OnePlus PLK110 (redwood)
- Unified guide v2.2 — data captured from a real device
+ Unified guide v2.3 — data captured from a real device
 =====================================================================
 
 WHAT THIS IS NOW
@@ -249,6 +249,23 @@ CRITICAL PRINCIPLE (conclusion from backup analysis):
      Even fewer random frequency dropouts (micro-stutter) — the tables
      are already trained. File: src/ai/qtable.rs.
 
+  TUNING v2.3 — STATS DUMP TO A FILE (telemetry, no website needed):
+
+  k) PERIODIC FULL-SNAPSHOT STATS FILE
+     The daemon now writes the complete snapshot — the same JSON the
+     web panel serves at /api/snapshot (all sensors, CPU/GPU freqs,
+     battery, scenario, AI mode, channels) — into a file every 60 s:
+       /data/vendor/thermal/stats.json
+     Path and interval come from properties (section 6). Writes are
+     atomic (tmp + rename) — the file is never truncated mid-write.
+     Pull it with:
+       adb shell su -c "cat /data/vendor/thermal/stats.json"
+     This is the raw feed you can feed into your own collector/graphs
+     (e.g. a cron pull via adb, or any on-device app), no server or
+     internet connection required. Enable the web panel too
+     (persist.mithermal.debug=1) if you want the live dashboard on
+     localhost.
+
   VERDICT: GPU is no longer choked (smoothness), idle gets reduced caps
   + instant Idle with the screen off (battery). Expected effect:
   +smoothness in games/UI, +0.5-1.5 h of screen time per charge at rest.
@@ -317,6 +334,14 @@ CRITICAL PRINCIPLE (conclusion from backup analysis):
        On next start it deletes /data/vendor/thermal/ai_data
        and starts learning from scratch. The property self-clears to 0.
 
+   Stats file:
+     setprop persist.sys.oosexgang.mi-thermald.stats.path /data/vendor/thermal/stats.json
+       Where the periodic snapshot is dumped (full JSON, same as
+       /api/snapshot). Empty string disables the stats writer.
+       Default: /data/vendor/thermal/stats.json
+     setprop persist.sys.oosexgang.mi-thermald.stats.interval 60
+       Dump interval in seconds (0 disables). Default 60.
+
    Full set for POCO X5 Pro:
      setprop persist.sys.oosexgang.mi-thermald.device redwood
      setprop persist.sys.oosexgang.mi-thermald.platform sm7325
@@ -352,5 +377,5 @@ CRITICAL PRINCIPLE (conclusion from backup analysis):
   src/web.rs         — web panel (localhost), enable persist.mithermal.debug=1
   .cargo/config.toml — NDK r27c linker for aarch64-linux-android
 =====================================================================
- END OF GUIDE v2.2
+ END OF GUIDE v2.3
 =====================================================================

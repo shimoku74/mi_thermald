@@ -833,7 +833,60 @@ fn thread_config_watch(
     }
 }
 
+// ------------------------------------------------------------------
+// Stats file writer: periodic full-snapshot JSON dump to a file
+// ------------------------------------------------------------------
 
+// Dumps the same full snapshot served by the web panel (/api/snapshot)
+// into a file on a timer, so stats can be pulled off-device (adb,
+// termux, any app). Path and interval come from persist.* properties:
+//   persist.sys.oosexgang.mi-thermald.stats.path     (default
+//     /data/vendor/thermal/stats.json; empty string disables)
+//   persist.sys.oosexgang.mi-thermald.stats.interval (seconds, 60)
+// Written atomically (tmp + rename) so the file is never truncated.
+fn thread_stats_writer(
+    engine: Arc<Mutex<crate::Engine>>,
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    let path = property_get_str(MI_PROP_MI_THERMALD_STATS_PATH, "/data/vendor/thermal/stats.json");
+    if path.trim().is_empty() {
+        log_info!("stats writer disabled (empty path)");
+        return;
+    }
+    let interval = property_get_str(MI_PROP_MI_THERMALD_STATS_INTERVAL, "60")
+        .trim()
+        .parse::<u64>()
+        .unwrap_or(60);
+    if interval == 0 {
+        log_info!("stats writer disabled (interval 0)");
+        return;
+    }
+    log_info!("stats writer: {} every {}s", path, interval);
+
+    let mut ok_flag = false;
+    while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+        std::thread::sleep(Duration::from_secs(interval));
+        if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+        let body = match engine.lock() {
+            Ok(eng) => serde_json::to_string(&web::collect_snapshot(&eng))
+                .unwrap_or_else(|_| "{}".into()),
+            Err(_) => continue,
+        };
+        let temp = format!("{}.tmp", path);
+        if fs::write(&temp, &body).is_ok() && fs::rename(&temp, &path).is_ok() {
+            if !ok_flag {
+                log_info!("stats writer: first write to {}", path);
+                ok_flag = true;
+            }
+        } else if ok_flag {
+            log_warn!("stats writer: write failed for {}", path);
+            ok_flag = false;
+        }
+    }
+    log_info!("stats writer stopped");
+}
 
 // ------------------------------------------------------------------
 // Main
@@ -873,6 +926,11 @@ fn main() {
         let s = shutdown.clone();
         threads.push(thread::spawn(move || web::thread_web_server(e, s)));
     }
+
+    // Stats file writer: full snapshot JSON on a timer (always on).
+    let e = engine.clone();
+    let s = shutdown.clone();
+    threads.push(thread::spawn(move || thread_stats_writer(e, s)));
 
     // Setup epoll
     let epoll_fd: RawFd;

@@ -1,4 +1,5 @@
 target/
 .cargo/
+/mi_thermald
 *.swp
 *.swo
