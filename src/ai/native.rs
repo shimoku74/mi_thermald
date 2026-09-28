@@ -104,6 +104,20 @@ fn action_cap_for_battery_level(soc_pct: i32, voltage_uv: i32) -> u8 {
 // so thermal safety always wins over the smoothness floor.
 const GPU_BUSY_ACTIVE_PCT: i32 = 25;
 
+// GPU "warm" hysteresis for smooth blur / notification-shade animation.
+// The `gpu` cooling channel only lifts the throttle *ceiling* (cur_state);
+// it does not stop the devfreq governor from dropping the GPU to its
+// lowest clock at idle. When the user then pulls the shade or a "liquid
+// glass" blur composits, the first frames render on a cold GPU and ramp
+// too late — visible stutter. To fix it we raise the GPU frequency *floor*
+// (kgsl min_pwrlevel) for a short window after any compositing/scroll
+// burst, so the GPU is already warm when the next animation starts.
+const GPU_WARM_HOLD_TICKS: u64 = 5;   // keep warm ~5s after last activity
+const GPU_WARM_BUSY_PCT: i32 = 15;    // GPU busy above this = compositing
+const GPU_WARM_CPU_LOAD: f32 = 0.30;  // a systemui/SurfaceFlinger CPU spike
+                                      // also signals an interaction burst
+const KGSL_BASE: &str = "/sys/class/kgsl/kgsl-3d0";
+
 fn read_gpu_busy_pct() -> i32 {
     // Adreno exposes busy either as a ready-made percentage or as a devfreq
     // load figure; some kernels append a "%" or trailing text, so take the
@@ -236,6 +250,13 @@ pub struct NativeController {
     // Forced workload mode: when Some, overrides the detected
     // workload on every tick (useful for testing / profiling).
     forced_workload: Option<WorkloadMode>,
+    // GPU "warm" hysteresis: ticks left holding a raised GPU frequency
+    // floor after the last compositing/scroll burst (see
+    // apply_gpu_smoothness). Keeps blur / shade animations from janking on
+    // a cold GPU that would otherwise idle at its lowest clock.
+    gpu_warm_ticks: u64,
+    // Last min_pwrlevel we wrote, to avoid redundant sysfs writes.
+    gpu_min_pwrlevel_applied: Option<i32>,
 }
 
 impl NativeController {
@@ -283,6 +304,8 @@ impl NativeController {
             platform,
             battery_saver: false,
             forced_workload: None,
+            gpu_warm_ticks: 0,
+            gpu_min_pwrlevel_applied: None,
         };
         // Read the remaining persist.* overrides that belong
         // to the controller (they were read after init_channels
@@ -694,6 +717,7 @@ impl NativeController {
         };
 
         self.apply_grouped_actions(&group_actions, sensor_readings);
+        self.apply_gpu_smoothness(state.cpu_load, state.screen_on);
 
         if let Some(ref ls) = prev_state {
             let state_array = self.feature_extractor.to_array(ls);
@@ -925,6 +949,62 @@ impl NativeController {
 
     pub fn apply_charge_protection(&mut self) {
         self.apply_temp_based_charge();
+    }
+
+    /// Hold a raised GPU frequency floor for a short window after any
+    /// compositing/scroll burst, so blur and shade animations don't stutter
+    /// on a GPU that would otherwise be idling at its lowest clock. Released
+    /// (GPU allowed back to its idle floor) when the screen is off or the
+    /// battery is low, so it never costs idle battery. Runs every tick.
+    fn apply_gpu_smoothness(&mut self, cpu_load: f32, screen_on: f32) {
+        let min_path = format!("{}/min_pwrlevel", KGSL_BASE);
+        if !std::path::Path::new(&min_path).exists() {
+            return;
+        }
+        // pwrlevels are indexed fastest(0) .. slowest(num-1). "idle" lets the
+        // GPU drop to its lowest clock; "warm" holds it one step up.
+        let num = crate::sensor::sysfs::read_int(&format!("{}/num_pwrlevels", KGSL_BASE));
+        if num <= 1 {
+            return;
+        }
+        let idle_level = num - 1;
+        let warm_level = (num - 2).max(0);
+
+        let screen_off = screen_on < 0.5;
+        // Only bail on a truly critical battery: holding the GPU one clock
+        // step above idle (e.g. 450 vs 315 MHz) is a small delta, not a peak
+        // current spike, so it doesn't risk a brownout the way action=9 would
+        // — no reason to sacrifice shade/blur smoothness across the whole
+        // normal 6–40% range where the user actually is.
+        let soc = crate::sensor::sysfs::read_int(
+            "/sys/class/power_supply/battery/capacity");
+        let critical_batt = soc >= 0 && soc <= CRITICAL_BATTERY_PCT;
+        if screen_off || critical_batt {
+            self.gpu_warm_ticks = 0;
+            self.set_gpu_min_pwrlevel(&min_path, idle_level);
+            return;
+        }
+
+        let gpu_busy = read_gpu_busy_pct();
+        let active = gpu_busy >= GPU_WARM_BUSY_PCT || cpu_load >= GPU_WARM_CPU_LOAD;
+        if active {
+            self.gpu_warm_ticks = GPU_WARM_HOLD_TICKS;
+        } else {
+            self.gpu_warm_ticks = self.gpu_warm_ticks.saturating_sub(1);
+        }
+
+        let target = if self.gpu_warm_ticks > 0 { warm_level } else { idle_level };
+        self.set_gpu_min_pwrlevel(&min_path, target);
+    }
+
+    fn set_gpu_min_pwrlevel(&mut self, path: &str, level: i32) {
+        if self.gpu_min_pwrlevel_applied == Some(level) {
+            return;
+        }
+        if crate::sensor::sysfs::write_int(path, level) {
+            self.gpu_min_pwrlevel_applied = Some(level);
+            log_debug!("GPU min_pwrlevel = {} (warm_ticks={})", level, self.gpu_warm_ticks);
+        }
     }
 
     fn apply_grouped_actions(&mut self, actions: &HashMap<ChannelGroup, u8>, sensors: &[Sensor]) {
