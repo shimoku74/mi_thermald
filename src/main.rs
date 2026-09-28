@@ -749,12 +749,21 @@ fn thread_poll_sensors(engine: Arc<Mutex<Engine>>, shutdown: Arc<AtomicBool>) {
 
 fn thread_cpu_freq_writer() {
     let policies = crate::cpu_policies().to_vec();
+    // Re-asserting an unchanged value is pure overhead: an open+write+close
+    // on a sysfs node, up to 3 times every 50ms, forever — including while
+    // the phone is completely idle with the screen off. Track the last
+    // value actually written per cluster and skip the syscalls when nothing
+    // changed; the atomic is still polled every tick so a real change is
+    // still applied within one 50ms window.
+    let mut last_written = vec![-1i32; policies.len()];
     loop {
-        for p in &policies {
+        for (i, p) in policies.iter().enumerate() {
             // FIX BUG-004: Use Acquire ordering to ensure visibility of writes
             let val = crate::cpu_target_atomic(p.slot).load(std::sync::atomic::Ordering::Acquire);
-            if val > 0 {
-                crate::sensor::sysfs::write_int(&p.path, val);
+            if val > 0 && val != last_written[i] {
+                if crate::sensor::sysfs::write_int(&p.path, val) {
+                    last_written[i] = val;
+                }
             }
         }
         thread::sleep(Duration::from_millis(50));

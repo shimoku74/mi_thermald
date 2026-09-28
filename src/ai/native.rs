@@ -491,6 +491,7 @@ impl NativeController {
                 let action = q_table.select_action(&state_array);
                 let safe = self.safety_monitor.is_action_safe(action, sensor_readings);
                 let mut final_action = if safe { action } else { 3u8 };
+                let screen_off = state.screen_on < 0.5;
 
                 if in_boot_phase {
                     // Boot-storm protection: keep everything conservative for
@@ -519,7 +520,6 @@ impl NativeController {
                         // this is the single biggest idle-battery win.
                         // battery-saver mode (screen on) applies stricter
                         // ceilings too, at the cost of burst headroom.
-                        let screen_off = state.screen_on < 0.5;
                         let caps = if group == ChannelGroup::Compute {
                             if screen_off {
                                 (0u8, 2u8)
@@ -570,9 +570,14 @@ impl NativeController {
                 // feels as a frequency cliff / jank. Ease drops by at
                 // most 2 steps per tick; raises stay instant so
                 // responsiveness is not hurt. Hazard-forced actions
-                // (safe == false) and the battery-temperature ladder
-                // below are NOT smoothed — thermal safety acts at once.
-                if safe {
+                // (safe == false), the screen-off ceiling and the
+                // battery-temperature ladder below are NOT smoothed —
+                // nobody is watching a black screen for jank, and thermal
+                // safety acts at once. Without this exemption the
+                // screen-off ceiling (meant to be a "hard" cap) took ~4
+                // seconds to actually take effect, burning full CPU/GPU
+                // power the entire time the screen was off.
+                if safe && !screen_off {
                     if let Some(&prev_a) = model.last_actions.get(&group) {
                         if final_action + 2 < prev_a {
                             final_action = prev_a - 2;
