@@ -53,6 +53,19 @@ pub const MI_PROP_MI_THERMALD_STATS_PATH: &str =
 pub const MI_PROP_MI_THERMALD_STATS_INTERVAL: &str =
     "persist.sys.oosexgang.mi-thermald.stats.interval";
 
+// Trust the Xiaomi thermal `sconfig` node as a workload signal. The
+// integer profile IDs there (6/10/40 = benchmark, 19/20 = gaming, …) are
+// specific to Xiaomi's thermal_list_*.xml scheme; on other OEMs (OnePlus/
+// ColorOS, etc.) the same node exists but its values mean something
+// entirely different, so mapping them Xiaomi-style silently pins a wrong
+// workload — e.g. sconfig=10 (a normal ColorOS default) reads as
+// "Benchmark", which forces max CPU/GPU forever and defeats every battery
+// ceiling. Default OFF: use robust sensor-based detection everywhere;
+// set "1"/"true" only on a genuine Xiaomi board whose sconfig scheme
+// matches profile_to_workload().
+pub const MI_PROP_MI_THERMALD_SCONFIG_MAP: &str =
+    "persist.sys.oosexgang.mi-thermald.sconfig.map";
+
 pub const MI_PROP_SOC_MODEL: &str = "ro.soc.model";
 pub const MI_PROP_THERMAL_DATA_PATH: &str = "vendor.sys.thermal.data.path";
 
