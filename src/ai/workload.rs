@@ -49,16 +49,16 @@ pub struct WorkloadDetector {
 
 impl WorkloadDetector {
     pub fn new() -> Self {
-        // The Xiaomi sconfig→profile map only means anything on a Xiaomi
-        // board; elsewhere (OnePlus/ColorOS …) the same node holds unrelated
-        // values that would mis-map to Benchmark/Gaming and force max
-        // performance forever. Gate it behind an explicit opt-in
-        // (default off) so every other device falls back to the portable
+        // Resolve the sconfig profile against the device's own thermal-map
+        // (ID -> scenario name) and classify the name; generic thermal
+        // severity levels defer to sensor detection, so this is safe even
+        // where a level is the persistent idle default (ColorOS nolimits).
+        // Enabled by default; set the property to "0"/"false" to force pure
         // sensor-based detection.
-        let sconfig_map_enabled = matches!(
+        let sconfig_map_enabled = !matches!(
             crate::property_get_str(
-                crate::types::MI_PROP_MI_THERMALD_SCONFIG_MAP, "0").as_str(),
-            "1" | "true"
+                crate::types::MI_PROP_MI_THERMALD_SCONFIG_MAP, "1").as_str(),
+            "0" | "false"
         );
         let sconfig_available =
             sconfig_map_enabled && ThermalProfileManager::is_sconfig_available();

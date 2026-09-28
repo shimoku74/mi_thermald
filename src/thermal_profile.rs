@@ -9,14 +9,26 @@ pub struct ThermalProfileManager {
     current_profile_id: u32,
     last_check_time: std::time::Instant,
     check_interval: std::time::Duration,
+    // Cached decrypted sconfig->config-name map from the device's own
+    // thermal-map.conf (e.g. "[10:thermal-nolimits.conf]"). Loaded once so
+    // profile IDs are resolved to real scenario names per-device instead of
+    // via a hardcoded Xiaomi number table that only matches one board.
+    map_content: Option<String>,
 }
 
 impl ThermalProfileManager {
     pub fn new() -> Self {
+        let map_content = crate::config::get_scenario_map_content();
+        if map_content.is_some() {
+            log_info!("Thermal map loaded for sconfig->workload resolution");
+        } else {
+            log_info!("Thermal map unavailable - sconfig profiles fall back to sensor detection");
+        }
         ThermalProfileManager {
             current_profile_id: 0,
             last_check_time: std::time::Instant::now(),
             check_interval: std::time::Duration::from_secs(1),  // Check every 1s
+            map_content,
         }
     }
 
@@ -68,42 +80,71 @@ impl ThermalProfileManager {
         self.current_profile_id
     }
 
-    /// Map thermal profile ID to workload mode
-    /// Based on thermal_list_marble.xml and thermal_list_peridot.xml analysis
+    /// Map a thermal profile ID to a workload mode by resolving it against
+    /// the device's own thermal-map (ID -> config-name) and then classifying
+    /// the *name*. This is portable across Xiaomi-derived ROMs because the
+    /// scenario names ("mgame", "tgame", "camera", "nolimits", …) are stable
+    /// even when the numeric IDs differ per board.
     pub fn profile_to_workload(&self, profile_id: u32) -> Option<crate::ai::WorkloadMode> {
-        use crate::ai::WorkloadMode;
-
-        match profile_id {
-            0 => None,  // Default/no profile, use sensor detection
-
-            // Benchmarks (Geekbench, AnTuTu, 3DMark, etc.)
-            6 | 10 | 40 => Some(WorkloadMode::Benchmark),
-
-            // heavy Gaming
-            18 | 39 => Some(WorkloadMode::PerfGaming),
-
-            // Gaming (Genshin, PUBG, COD, Fortnite, etc.)
-            19 | 20 => Some(WorkloadMode::Gaming),
-
-            // Camera apps (burst load)
-            12 | 15 | 42 => Some(WorkloadMode::Moderate),
-
-            // Video players (VLC, YouTube, sustained decode)
-            11 | 21 | 51 | 61 => Some(WorkloadMode::Moderate),
-
-            // Streaming/social media (Netflix, Instagram, light load)
-            7 | 41 => Some(WorkloadMode::Light),
-
-            // Unknown profile - fall back to sensor detection
-            _ => {
-                log_debug!("Unknown thermal profile ID: {}, using sensor detection", profile_id);
-                None
-            }
+        if profile_id == 0 {
+            return None; // Default/no profile — use sensor detection
         }
+        let map = self.map_content.as_ref()?;
+        let fname = crate::config::find_scenario_name(map, profile_id as i32);
+        let mode = config_name_to_workload(&fname);
+        match mode {
+            Some(m) => log_debug!("sconfig {} -> {} -> {:?}", profile_id, fname, m),
+            None => log_debug!("sconfig {} -> {} (generic level, sensor detection)", profile_id, fname),
+        }
+        mode
     }
 
     /// Check if sconfig node is available on this device
     pub fn is_sconfig_available() -> bool {
         std::path::Path::new(THERMAL_SCONFIG_NODE).exists()
+    }
+}
+
+/// Classify a scenario *config name* (as listed in the device thermal-map,
+/// e.g. "thermal-mgame.conf", "thermal-india-nolimits.conf") into a workload
+/// mode. Region ("india-"/"per-"), the "thermal-" prefix, the "-unfold"
+/// (foldable) suffix and the extension are all stripped first so the same
+/// scenario matches regardless of variant.
+///
+/// Generic thermal-*severity* levels (normal/high/extreme/nolimits) are the
+/// framework's thermal STATE, not a workload — on some ROMs (e.g. ColorOS)
+/// one of them is the persistent idle default (sconfig=10 -> nolimits), so
+/// mapping them to a workload would pin it forever. Those return None to
+/// defer to sensor-based detection; only app/scenario-specific profiles are
+/// treated as a real workload hint.
+pub fn config_name_to_workload(fname: &str) -> Option<crate::ai::WorkloadMode> {
+    use crate::ai::WorkloadMode;
+
+    let base = fname.rsplit('/').next().unwrap_or(fname);
+    let base = base.strip_suffix(".txt").unwrap_or(base);
+    let base = base.strip_suffix(".conf").unwrap_or(base);
+    let base = base.strip_prefix("thermal-").unwrap_or(base);
+    let base = base.strip_prefix("india-").unwrap_or(base);
+    let base = base.strip_prefix("per-").unwrap_or(base);
+    let base = base.strip_suffix("-unfold").unwrap_or(base);
+
+    match base {
+        // Generic thermal severity levels / non-workloads → sensor detection.
+        "normal" | "high" | "extreme" | "nolimits" | "chg-only" | "engine" => None,
+
+        // Heavy 3D game / AR-VR: sustained peak, wants full headroom.
+        "mgame" | "hp-mgame" | "arvr" => Some(WorkloadMode::PerfGaming),
+        // Regular game.
+        "tgame" => Some(WorkloadMode::Gaming),
+
+        // Sustained media decode, camera and navigation: steady mid load.
+        "video" | "videochat" | "youtube" | "dolbyvision" | "4k" | "8k"
+        | "camera" | "navigation" | "huanji" => Some(WorkloadMode::Moderate),
+
+        // Light interactive foreground.
+        "phone" | "class0" => Some(WorkloadMode::Light),
+
+        // Unknown scenario name → let the sensors decide.
+        _ => None,
     }
 }
