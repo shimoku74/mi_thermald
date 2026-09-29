@@ -773,6 +773,94 @@ fn thread_cpu_freq_writer() {
     }
 }
 
+// GPU interaction booster (fast path, ~100ms).
+//
+// The main thermal tick runs once a second — far too slow to react to a
+// ~300-500ms notification-shade / "liquid glass" blur animation. And on
+// this class of device the GPU's own devfreq governor is tuned for battery:
+// it leaves the GPU parked at its lowest clock even at ~30% busy during a
+// blur pass, so the animation renders slowly = visible stutter. Neither
+// mi_thermald's cur_state throttle (which we already keep at "no throttle"
+// while the screen is on) nor the governor raises the clock in time.
+//
+// This dedicated thread polls GPU busy every 100ms and, the moment real
+// rendering starts, pins the GPU frequency floor (kgsl min_pwrlevel) to its
+// top level so the blur/scroll runs at full clock. It releases the floor a
+// short tail after activity stops, so a static screen (GPU ~1-2% busy) never
+// pays for it. Gated off when the screen is off, the battery is critically
+// low, or the battery is hot — thermal/charge safety always wins. Writes are
+// de-duplicated. No kgsl node -> the thread is a no-op (non-Adreno device).
+fn thread_gpu_floor() {
+    const KGSL: &str = "/sys/class/kgsl/kgsl-3d0";
+    let min_path = format!("{}/min_pwrlevel", KGSL);
+    let busy_path = format!("{}/gpu_busy_percentage", KGSL);
+    if !std::path::Path::new(&min_path).exists() {
+        return;
+    }
+    let num = sysfs::read_int(&format!("{}/num_pwrlevels", KGSL));
+    if num <= 1 {
+        return; // single pwrlevel, nothing to boost
+    }
+    let boost_level = 0;        // fastest pwrlevel (highest GPU clock)
+    let idle_level = num - 1;   // slowest — let the governor idle it down
+
+    // Read the property gate once (default on).
+    let enabled = crate::property_get_str(
+        crate::types::MI_PROP_MI_THERMALD_GPU_BOOST, "1");
+    if matches!(enabled.as_str(), "0" | "false") {
+        log_info!("GPU booster disabled by property");
+        // Make sure we don't leave a floor pinned from a previous run.
+        sysfs::write_int(&min_path, idle_level);
+        return;
+    }
+    log_info!("GPU booster active (min_pwrlevel {}..={}, 100ms)", boost_level, idle_level);
+
+    const BUSY_PCT: i32 = 15;       // above this = real rendering (idle ~1-2%)
+    const TAIL_POLLS: u32 = 8;      // ~800ms hold after the last busy sample
+    const BATT_HOT_MC: i32 = 430;   // 43.0°C — above this, defer to cooling
+    const CRIT_SOC: i32 = 5;        // below this, save every mW
+
+    let mut hold: u32 = 0;
+    let mut last_written = -1;
+    loop {
+        let brightness = sysfs::read_int(
+            "/sys/class/backlight/panel0-backlight/brightness");
+        let screen_on = brightness > 0;
+        let soc = sysfs::read_int("/sys/class/power_supply/battery/capacity");
+        let batt_temp = sysfs::read_int("/sys/class/power_supply/battery/temp");
+        let busy = {
+            // node reports e.g. "32 %" — take the leading digits
+            let s = sysfs::read_string(&busy_path).unwrap_or_default();
+            s.trim().chars().take_while(|c| c.is_ascii_digit())
+                .collect::<String>().parse::<i32>().unwrap_or(0)
+        };
+
+        let allow = screen_on
+            && !(soc >= 0 && soc <= CRIT_SOC)
+            && !(batt_temp >= 0 && batt_temp >= BATT_HOT_MC);
+
+        if allow && busy >= BUSY_PCT {
+            hold = TAIL_POLLS;
+        } else if hold > 0 {
+            hold -= 1;
+        }
+
+        let target = if allow && hold > 0 { boost_level } else { idle_level };
+        if target != last_written {
+            if sysfs::write_int(&min_path, target) {
+                last_written = target;
+            }
+        }
+
+        thread::sleep(Duration::from_millis(100));
+        if G_TERM.load(Ordering::Relaxed) {
+            // Release the floor on shutdown so we don't leave the GPU pinned.
+            sysfs::write_int(&min_path, idle_level);
+            break;
+        }
+    }
+}
+
 fn thread_fcc_writer() {
     let path = "/sys/class/power_supply/battery/constant_charge_current";
     let mut last_fcc = 0;
@@ -920,6 +1008,7 @@ fn main() {
 
     threads.push(thread::spawn(|| thread_cpu_freq_writer()));
     threads.push(thread::spawn(|| thread_fcc_writer()));
+    threads.push(thread::spawn(|| thread_gpu_floor()));
 
     let s = shutdown.clone();
     let tx = reload_tx;

@@ -64,6 +64,14 @@ pub const MI_PROP_MI_THERMALD_STATS_INTERVAL: &str =
 pub const MI_PROP_MI_THERMALD_SCONFIG_MAP: &str =
     "persist.sys.oosexgang.mi-thermald.sconfig.map";
 
+// GPU interaction booster: a fast (~100ms) thread that pins the GPU
+// frequency floor to its top level while the GPU is actively rendering
+// (notification-shade / blur / scroll), then releases it shortly after, so
+// animations don't stutter on a governor that otherwise parks the GPU at
+// its lowest clock. Default ON; set "0"/"false" to disable (pure governor).
+pub const MI_PROP_MI_THERMALD_GPU_BOOST: &str =
+    "persist.sys.oosexgang.mi-thermald.gpu.boost";
+
 pub const MI_PROP_SOC_MODEL: &str = "ro.soc.model";
 pub const MI_PROP_THERMAL_DATA_PATH: &str = "vendor.sys.thermal.data.path";
 
