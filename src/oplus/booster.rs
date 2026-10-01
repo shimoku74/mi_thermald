@@ -94,7 +94,7 @@ pub fn thread_oplus_boost() {
     }
 
     let mut grp = FrameGroup::new(now_ns());
-    grp.set_frame_rate(prop_i32(MI_PROP_MI_THERMALD_OPLUS_FPS, 60).clamp(1, 144) as u32);
+    grp.set_frame_rate(prop_i32(MI_PROP_MI_THERMALD_OPLUS_FPS, 120).clamp(1, 144) as u32);
     // Userspace can't see BufferQueue depth: assume double buffering.
     grp.info.buffer_count = 2;
     grp.stune.set(StuneBoost::DefFreq, prop_i32(MI_PROP_MI_THERMALD_OPLUS_FREQ_BOOST, 20).clamp(-100, 100));

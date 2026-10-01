@@ -77,7 +77,7 @@ pub const MI_PROP_MI_THERMALD_GPU_BOOST: &str =
 // the thermal ceiling. Default ON; "0"/"false" disables.
 pub const MI_PROP_MI_THERMALD_OPLUS_BOOST: &str =
     "persist.sys.oosexgang.mi-thermald.oplus.boost";
-// Display frame rate the frame window follows (1-144, default 60).
+// Display frame rate the frame window follows (1-144, default 120).
 pub const MI_PROP_MI_THERMALD_OPLUS_FPS: &str =
     "persist.sys.oosexgang.mi-thermald.oplus.fps";
 // schedtune BOOST_DEF_FREQ / BOOST_DEF_MIGR percent (-100..100, default 20).

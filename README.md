@@ -247,7 +247,7 @@ no CPU.
 | Property (`persist.sys.oosexgang.mi-thermald.`) | Default | Meaning |
 |---|---|---|
 | `oplus.boost` | `1` | enable the booster |
-| `oplus.fps` | `60` | frame rate that sets the window length |
+| `oplus.fps` | `120` | frame rate that sets the window length |
 | `oplus.freq_boost` / `oplus.migr_boost` | `20` / `20` | `BOOST_DEF_FREQ` / `BOOST_DEF_MIGR` (%) |
 | `oplus.touch_util` | `300` | `frame_min_util` while touch events arrive |
 | `oplus.hold_ms` | `1500` | how long USER_ZONE stays on after the last touch |
