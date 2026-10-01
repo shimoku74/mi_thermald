@@ -205,6 +205,54 @@ The `charge_current` channel is never driven by its Q-table's raw action value �
 
 The Charging group's Q-table still learns and selects actions — its reward (`charge_current_ratio` term) reflects the *outcome* of this protection logic, giving the RL a signal about charging speed without it ever directly controlling the current.
 
+## OPLUS CPU Frame Booster (`src/oplus`)
+
+A userspace port of the OnePlus/OPLUS kernel CPU boost and thermal-capacity
+logic (`vendor/oplus/kernel/cpu/sched` in
+[android_kernel_modules_and_devicetree_oneplus_sm8550](https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8550/tree/oneplus/sm8550_v_15.0.0_oneplus11/vendor/oplus/kernel/cpu/sched)).
+It runs as its own thread and sets a cpufreq floor (`scaling_min_freq`) on
+the preferred cluster while you touch the screen.
+
+| File | Ported from | What it does |
+|------|-------------|--------------|
+| `frame_info.rs` | `frame_boost/multi_rtg/frame_info.c` | frame rate/interval, putil, vutil parabola, `frame_uclamp` |
+| `frame_group.rs` | `frame_group.c` | window rollover, frame zone, `update_freq_policy_util` (QCOM branch), handler_busy, ED boost (0.6/0.8 window → util 600/900) |
+| `stune.rs` | `frame_group.c` | schedtune SPC margin `M = B·(1024−S)/100`, stune_boost defaults |
+| `cluster.rs` | `frame_group.c`, `eas_opt/fake_cap.c` | cluster build, thermal-pressure capacity, `best_cluster` + available cluster, `map_util_freq` |
+| `iowait.rs` | `eas_opt/oplus_iowait.c` + schedutil | iowait boost (apply/reset ticks, skip little cluster) |
+| `load.rs` | `update_frame_group_util`, `scale_exec_time` | per-CPU run time from `/proc/schedstat` (falls back to `/proc/stat`) |
+| `input.rs` | `sysctl_input_boost_enabled` (USER_ZONE) | detects touch activity on the multitouch `/dev/input/event*` (counts events only) |
+| `booster.rs` | `fbg_freq_policy_util` / `default_group_update_cpufreq` | the thread that ties it together |
+
+**What differs from the kernel version.** Userspace has no per-task
+accounting, no vsync or queueBuffer callbacks, and no access to BufferQueue
+depth. So the port:
+- uses the busiest CPU instead of the frame group's tasks,
+- infers frame start and end from load (a frame starts on touch or when the
+  last window was busy, and ends when the CPU goes idle),
+- assumes a buffer count of 2,
+- applies the result as a frequency floor. The kernel version feeds util to
+  the governor and steers task placement instead.
+
+**Thermal always wins.**
+- Each floor is capped at mi_thermald's own thermal ceiling for that cluster.
+- That ceiling also reduces the cluster's capacity (`fake_cap` thermal
+  pressure), so a throttled cluster is no longer chosen as preferred.
+- The booster turns off when the screen is off, the battery is at ≤5%, or
+  the battery is at ≥43 °C.
+
+When nothing is touching the screen, the thread waits in `poll()` and uses
+no CPU.
+
+| Property (`persist.sys.oosexgang.mi-thermald.`) | Default | Meaning |
+|---|---|---|
+| `oplus.boost` | `1` | enable the booster |
+| `oplus.fps` | `60` | frame rate that sets the window length |
+| `oplus.freq_boost` / `oplus.migr_boost` | `20` / `20` | `BOOST_DEF_FREQ` / `BOOST_DEF_MIGR` (%) |
+| `oplus.touch_util` | `300` | `frame_min_util` while touch events arrive |
+| `oplus.hold_ms` | `1500` | how long USER_ZONE stays on after the last touch |
+| `oplus.iowait` | `1` | iowait boost |
+
 ## Compilation
 
 ### Prerequisites
