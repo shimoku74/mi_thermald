@@ -72,28 +72,12 @@ pub const MI_PROP_MI_THERMALD_SCONFIG_MAP: &str =
 pub const MI_PROP_MI_THERMALD_GPU_BOOST: &str =
     "persist.sys.oosexgang.mi-thermald.gpu.boost";
 
-// OPLUS CPU frame booster (src/oplus): raises the preferred cluster's
-// cpufreq floor from frame-window util during touch interaction, capped by
-// the thermal ceiling. Default ON; "0"/"false" disables.
-pub const MI_PROP_MI_THERMALD_OPLUS_BOOST: &str =
-    "persist.sys.oosexgang.mi-thermald.oplus.boost";
-// Display frame rate the frame window follows (1-144, default 120).
-pub const MI_PROP_MI_THERMALD_OPLUS_FPS: &str =
-    "persist.sys.oosexgang.mi-thermald.oplus.fps";
-// schedtune BOOST_DEF_FREQ / BOOST_DEF_MIGR percent (-100..100, default 20).
-pub const MI_PROP_MI_THERMALD_OPLUS_FREQ_BOOST: &str =
-    "persist.sys.oosexgang.mi-thermald.oplus.freq_boost";
-pub const MI_PROP_MI_THERMALD_OPLUS_MIGR_BOOST: &str =
-    "persist.sys.oosexgang.mi-thermald.oplus.migr_boost";
-// frame_min_util held while the finger is down (0-1024, default 300).
-pub const MI_PROP_MI_THERMALD_OPLUS_TOUCH_UTIL: &str =
-    "persist.sys.oosexgang.mi-thermald.oplus.touch_util";
-// How long USER_ZONE lasts after the last touch event, ms (default 1500).
-pub const MI_PROP_MI_THERMALD_OPLUS_HOLD_MS: &str =
-    "persist.sys.oosexgang.mi-thermald.oplus.hold_ms";
-// iowait boost (oplus_iowait_boost_enabled). Default ON.
-pub const MI_PROP_MI_THERMALD_OPLUS_IOWAIT: &str =
-    "persist.sys.oosexgang.mi-thermald.oplus.iowait";
+// OPLUS sched-module integration (src/oplus_sched): enables the kernel's own
+// sched_assist + frame_boost switches and feeds frame_boost touch events, so
+// the in-kernel UX scheduler smooths games/scrolling. No-op if the module is
+// not in the kernel. Default ON; "0"/"false" disables.
+pub const MI_PROP_MI_THERMALD_OPLUS_SCHED: &str =
+    "persist.sys.oosexgang.mi-thermald.oplus.sched";
 
 pub const MI_PROP_SOC_MODEL: &str = "ro.soc.model";
 pub const MI_PROP_THERMAL_DATA_PATH: &str = "vendor.sys.thermal.data.path";

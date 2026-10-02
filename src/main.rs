@@ -11,8 +11,8 @@ mod algorithm;
 mod action;
 mod ai;
 mod thermal_profile;
+mod oplus_sched;
 mod web;
-mod oplus;
 
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -1010,7 +1010,7 @@ fn main() {
     threads.push(thread::spawn(|| thread_cpu_freq_writer()));
     threads.push(thread::spawn(|| thread_fcc_writer()));
     threads.push(thread::spawn(|| thread_gpu_floor()));
-    threads.push(thread::spawn(|| oplus::thread_oplus_boost()));
+    threads.push(thread::spawn(|| oplus_sched::thread_oplus_sched()));
 
     let s = shutdown.clone();
     let tx = reload_tx;
