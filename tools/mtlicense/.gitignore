@@ -1,0 +1,6 @@
+target/
+keys/
+*.key
+*.pub
+*.bin
+embed_pubkey.txt
