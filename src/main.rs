@@ -12,6 +12,7 @@ mod action;
 mod ai;
 mod thermal_profile;
 mod web;
+mod oplus;
 
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -199,6 +200,8 @@ struct Engine {
 
     ai_engine: Option<ai::AIEngine>,
     native_controller: Option<ai::NativeController>,
+    // oplus bsp context -- frame_boost, sched_assist, memory, lahaina tuner
+    oplus_ctx: Option<oplus::OplusContext>,
 }
 
 impl Engine {
@@ -214,6 +217,7 @@ impl Engine {
             current_scenario_idx: 0,
             ai_engine: None,
             native_controller: None,
+            oplus_ctx: None,
         }
     }
 
@@ -266,6 +270,9 @@ impl Engine {
 
         let soc = property_get_str(MI_PROP_SOC_MODEL, "default");
         log_info!("thermald start soc={}", soc);
+
+        // init oplus context -- frame_boost, sched_assist, memory, lahaina tuner
+        self.oplus_ctx = Some(oplus::OplusContext::new());
 
         let ai_prop = property_get_str("ro.vendor.mi_thermal_ai", "false");
         let ai_enabled = ai_prop == "true" || ai_prop == "1";
@@ -321,9 +328,9 @@ impl Engine {
         // to avoid the 90°C+ spike that occurs when the CPU runs at full
         // speed for the entire first second before thermal control kicks in.
         let caps = [
-            ("/sys/devices/system/cpu/cpufreq/policy0/scaling_max_freq", 1209600, &CPU_FREQ0_TARGET),
-            ("/sys/devices/system/cpu/cpufreq/policy3/scaling_max_freq", 1681920, &CPU_FREQ3_TARGET),
-            ("/sys/devices/system/cpu/cpufreq/policy7/scaling_max_freq", 1808640, &CPU_FREQ7_TARGET),
+            ("/sys/devices/system/cpu/cpufreq/policy0/scaling_max_freq", 1804800, &CPU_FREQ0_TARGET),
+            ("/sys/devices/system/cpu/cpufreq/policy4/scaling_max_freq", 2400000, &CPU_FREQ3_TARGET),
+            ("/sys/devices/system/cpu/cpufreq/policy7/scaling_max_freq", 2400000, &CPU_FREQ7_TARGET),
         ];
         for (path, val, atomic) in &caps {
             atomic.store(*val, Ordering::Relaxed);
@@ -335,10 +342,10 @@ impl Engine {
     fn setup_signals(&self) {
         unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();
-            sa.sa_sigaction = signal_term as libc::sighandler_t;
+            sa.sa_sigaction = signal_term as *const () as libc::sighandler_t;
             libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
             libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
-            sa.sa_sigaction = signal_usr1 as libc::sighandler_t;
+            sa.sa_sigaction = signal_usr1 as *const () as libc::sighandler_t;
             libc::sigaction(libc::SIGUSR1, &sa, std::ptr::null_mut());
             libc::signal(libc::SIGPIPE, libc::SIG_IGN);
         }
@@ -371,6 +378,27 @@ impl Engine {
         }
 
         self.evaluate_virtual_sensors();
+
+        // oplus tick -- update horae skin temp, drive frame_boost
+        if let Some(ref mut ctx) = self.oplus_ctx {
+            ctx.tick();
+
+            let mut board_temp = 35;
+            let mut bat_temp = 30;
+            for s in &self.sensors {
+                let name = s.name.to_ascii_lowercase();
+                let t_mc = s.last_temp_mc.load(std::sync::atomic::Ordering::Relaxed);
+                if t_mc > 0 && t_mc < 120_000 {
+                    let t_c = t_mc / 1000;
+                    if name.contains("battery") {
+                        bat_temp = t_c;
+                    } else if name.contains("quiet") || name.contains("board") || name.contains("skin") || name.contains("xo_therm") {
+                        board_temp = t_c;
+                    }
+                }
+            }
+            ctx.update_skin_temperatures(board_temp, bat_temp);
+        }
 
         let mut ai_engine = self.ai_engine.take();
         let ai_enabled = ai_engine.as_ref()
@@ -435,6 +463,13 @@ impl Engine {
 
         if level != traditional_level {
             self.instances[i].current_level = level;
+        }
+
+        // oplus hook: on level change notify thermal state
+        if level != prev_level {
+            if let Some(ref mut ctx) = self.oplus_ctx {
+                ctx.on_thermal_level_change(level);
+            }
         }
 
         if self.instances[i].actions.is_empty() {
@@ -591,7 +626,7 @@ fn thread_poll_sensors(engine: Arc<Mutex<Engine>>, shutdown: Arc<AtomicBool>) {
 fn thread_cpu_freq_writer() {
     let paths = [
         (0, "/sys/devices/system/cpu/cpufreq/policy0/scaling_max_freq", &CPU_FREQ0_TARGET),
-        (3, "/sys/devices/system/cpu/cpufreq/policy3/scaling_max_freq", &CPU_FREQ3_TARGET),
+        (4, "/sys/devices/system/cpu/cpufreq/policy4/scaling_max_freq", &CPU_FREQ3_TARGET),
         (7, "/sys/devices/system/cpu/cpufreq/policy7/scaling_max_freq", &CPU_FREQ7_TARGET),
     ];
     loop {
@@ -684,6 +719,164 @@ fn thread_config_watch(
 // Main
 // ------------------------------------------------------------------
 
+// Cheap (sub-millisecond) foreground-package sources. Reading a few small
+// procfs/sysfs nodes costs effectively nothing, so these are polled at full
+// rate by thread_oplus_app_watcher.
+const FG_NODES: [&str; 3] = [
+    "/proc/oplus_scheduler/sched_assist/top_app_pkg",
+    "/sys/class/thermal/thermal_message/currentpackage",
+    "/dev/sys_thermal_top_pkg",
+];
+
+// Expensive fallback. `dumpsys activity top` is a binder round-trip into
+// system_server that dumps the whole activity/window tree; it typically burns
+// tens to hundreds of milliseconds of CPU. Forking it on a fast timer is a
+// direct cause of the frame drops and input lag we are trying to remove, so it
+// is throttled hard and backed off when it yields nothing.
+static FG_DUMPSYS_LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FG_DUMPSYS_BACKOFF: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Read the foreground package from cheap procfs/sysfs nodes only.
+/// Returns None when no cheap source is available on this kernel.
+fn read_foreground_pkg_fast() -> Option<String> {
+    for p in FG_NODES.iter() {
+        if let Some(s) = crate::sensor::sysfs::read_string(p) {
+            let s = s.trim();
+            if !s.is_empty() && s != "none" {
+                return Some(s.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Expensive foreground lookup via dumpsys. Rate-limited by the caller.
+fn read_foreground_pkg_dumpsys() -> Option<String> {
+    for exe in ["/system/bin/dumpsys", "dumpsys"] {
+        let output = match std::process::Command::new(exe)
+            .args(&["activity", "top"])
+            .output()
+        {
+            Ok(o) => o,
+            Err(_) => continue,
+        };
+        let text = match std::str::from_utf8(&output.stdout) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+
+        // Primary form: "  ACTIVITY com.pkg/.SomeActivity 1234 pid=5678"
+        for line in text.lines() {
+            if let Some(idx) = line.find("ACTIVITY ") {
+                let rest = &line[idx + 9..];
+                if let Some(slash_idx) = rest.find('/') {
+                    let pkg = rest[..slash_idx].trim();
+                    if !pkg.is_empty() && pkg != "none" {
+                        return Some(pkg.to_string());
+                    }
+                }
+            }
+        }
+
+        // Secondary form: "  mResumedActivity: ActivityRecord{... com.pkg/.Act ...}"
+        for line in text.lines() {
+            if let Some(idx) = line.find("mResumedActivity") {
+                let rest = &line[idx..];
+                if let Some(p0) = rest.find(char::is_alphabetic) {
+                    let tail = &rest[p0..];
+                    if let Some(slash_idx) = tail.find('/') {
+                        let pkg = tail[..slash_idx].trim();
+                        if !pkg.is_empty() && pkg.contains('.') {
+                            return Some(pkg.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Foreground package, cheap path first, throttled dumpsys fallback.
+/// Returns an empty String when the value could not be determined this tick --
+/// callers MUST treat that as "no new information", not as "no game".
+fn read_foreground_pkg() -> String {
+    if let Some(pkg) = read_foreground_pkg_fast() {
+        // A cheap source answered; any accumulated backoff is irrelevant.
+        FG_DUMPSYS_BACKOFF.store(0, std::sync::atomic::Ordering::Relaxed);
+        return pkg;
+    }
+
+    use std::sync::atomic::Ordering;
+    let now = now_millis();
+    let last = FG_DUMPSYS_LAST.load(Ordering::Relaxed);
+    let backoff = FG_DUMPSYS_BACKOFF.load(Ordering::Relaxed);
+    // 2 s base, growing to 10 s while dumpsys keeps producing nothing usable.
+    let min_interval = 2000u64 + backoff;
+    if last != 0 && now.saturating_sub(last) < min_interval {
+        return String::new();
+    }
+    FG_DUMPSYS_LAST.store(now, Ordering::Relaxed);
+
+    match read_foreground_pkg_dumpsys() {
+        Some(pkg) => {
+            FG_DUMPSYS_BACKOFF.store(0, Ordering::Relaxed);
+            pkg
+        }
+        None => {
+            FG_DUMPSYS_BACKOFF.store((backoff * 2).min(8000), Ordering::Relaxed);
+            log_warn!("oplus/watcher: dumpsys returned no foreground package");
+            String::new()
+        }
+    }
+}
+
+// background thread: poll foreground app and drive oplus game mode transitions
+fn thread_oplus_app_watcher(
+    engine: std::sync::Arc<std::sync::Mutex<Engine>>,
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    let mut last_pkg = String::new();
+    let interval = std::time::Duration::from_millis(500); // check every 500ms
+
+    loop {
+        if shutdown.load(std::sync::atomic::Ordering::Relaxed) { break; }
+        std::thread::sleep(interval);
+
+        let pkg = read_foreground_pkg();
+
+        // Empty means "lookup did not resolve this tick" (throttled dumpsys or
+        // transient failure). It does NOT mean the game closed -- acting on it
+        // would flap between on_game_enter/on_game_exit and thrash the kernel
+        // nodes on every miss.
+        if pkg.is_empty() || pkg == last_pkg { continue; }
+
+        if let Ok(mut eng) = engine.lock() {
+            if let Some(ref mut ctx) = eng.oplus_ctx {
+                let was_game = ctx.frame_boost.is_in_game();
+                let is_game  = ctx.per_app.is_game(&pkg);
+
+                if is_game && !was_game {
+                    log_info!("oplus/watcher: game detected pkg={}", pkg);
+                    ctx.on_game_enter(&pkg);
+                } else if !is_game && was_game {
+                    log_info!("oplus/watcher: game exit, now pkg={}", pkg);
+                    ctx.on_game_exit();
+                }
+            }
+        }
+
+        last_pkg = pkg;
+    }
+}
+
 fn main() {
     let mut engine = Engine::new();
     if engine.init() != 0 {
@@ -700,6 +893,11 @@ fn main() {
     let e = engine.clone();
     let s = shutdown.clone();
     threads.push(thread::spawn(move || thread_poll_sensors(e, s)));
+
+    // oplus: foreground app watcher -> game mode transitions
+    let e = engine.clone();
+    let s = shutdown.clone();
+    threads.push(thread::spawn(move || thread_oplus_app_watcher(e, s)));
 
     threads.push(thread::spawn(|| thread_cpu_freq_writer()));
     threads.push(thread::spawn(|| thread_fcc_writer()));
