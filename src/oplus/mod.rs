@@ -15,6 +15,9 @@ pub mod thermal_governor;
 pub mod memory;
 pub mod lahaina;
 pub mod process_tracker;
+pub mod netlink;
+pub mod midas;
+pub mod network;
 
 pub use per_app_thermal::PerAppThermal;
 pub use frame_boost::FrameBoostController;
@@ -23,8 +26,18 @@ pub use thermal_governor::ThermalGovernor;
 pub use memory::MemoryManager;
 pub use lahaina::LahainaTuner;
 pub use process_tracker::ProcessTracker;
+pub use midas::MidasController;
+pub use network::RouterBoost;
 
 use crate::sensor::sysfs;
+use std::os::unix::fs::MetadataExt;
+
+/// Owning uid of a process, read from /proc/<pid> ownership (st_uid). Used
+/// to hand RouterBoost the game app's real uid without needing root-only
+/// /proc/<pid>/status parsing.
+fn process_uid(pid: i32) -> Option<u32> {
+    std::fs::metadata(format!("/proc/{}", pid)).ok().map(|m| m.uid())
+}
 
 /// Detect if host is running on Qualcomm SM8350 (Lahaina)
 /// Reads /sys/devices/soc0/soc_id (415 = SM8350)
@@ -50,6 +63,8 @@ pub struct OplusContext {
     pub memory: MemoryManager,
     pub tuner: LahainaTuner,
     pub tracker: ProcessTracker,
+    pub midas: MidasController,
+    pub router: RouterBoost,
     pub is_lahaina: bool,
     pub current_pkg: String,
     pub current_pid: Option<i32>,
@@ -68,6 +83,8 @@ impl OplusContext {
         let memory = MemoryManager::new();
         let tuner = LahainaTuner::new();
         let mut tracker = ProcessTracker::new();
+        let midas = MidasController::new();
+        let router = RouterBoost::new();
 
         // Hook SurfaceFlinger and RenderEngine on startup
         tracker.hook_surfaceflinger(&frame_boost, &sched);
@@ -85,6 +102,8 @@ impl OplusContext {
             memory,
             tuner,
             tracker,
+            midas,
+            router,
             is_lahaina,
             current_pkg: String::new(),
             current_pid: None,
@@ -139,6 +158,14 @@ impl OplusContext {
         if let Some(pid) = process_tracker::find_pid_by_name(pkg) {
             self.current_pid = Some(pid);
             self.tracker.hook_game_process(pid, &mut self.frame_boost, &self.sched, fps);
+
+            // 7. RouterBoost: mark this app's uid as the active game so the
+            // kernel's network stack prioritizes its traffic (lower latency
+            // on the primary Wi-Fi interface). Network-only; does not touch
+            // CPU frequency or scheduling.
+            if let Some(uid) = process_uid(pid) {
+                self.router.set_game(uid);
+            }
         }
     }
 
@@ -152,7 +179,10 @@ impl OplusContext {
         // 1. Clear process hooks
         self.tracker.clear_game_hooks(&mut self.frame_boost);
 
-        // 2. Frame Boost exit
+        // 2. RouterBoost: clear the game-playing flag (network QoS)
+        self.router.clear_game();
+
+        // 3. Frame Boost exit
         self.frame_boost.exit_game();
 
         // 3. Sched Assist clear scenes
