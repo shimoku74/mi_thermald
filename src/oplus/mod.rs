@@ -39,6 +39,22 @@ fn process_uid(pid: i32) -> Option<u32> {
     std::fs::metadata(format!("/proc/{}", pid)).ok().map(|m| m.uid())
 }
 
+/// Screen on/off from panel backlight brightness. Defaults to "on" when no
+/// backlight node is found, so a device we can't read never gets the
+/// screen-off treatment by mistake.
+fn read_screen_on() -> bool {
+    const PATHS: &[&str] = &[
+        "/sys/class/backlight/panel0-backlight/brightness",
+        "/sys/class/leds/lcd-backlight/brightness",
+    ];
+    for p in PATHS {
+        if let Some(v) = sysfs::read_int_checked(p) {
+            return v > 0;
+        }
+    }
+    true
+}
+
 /// Detect if host is running on Qualcomm SM8350 (Lahaina)
 /// Reads /sys/devices/soc0/soc_id (415 = SM8350)
 pub fn detect_platform() -> bool {
@@ -69,6 +85,9 @@ pub struct OplusContext {
     pub current_pkg: String,
     pub current_pid: Option<i32>,
     pub current_thermal_level: i32,
+    /// Last observed screen state (None until first tick), used to drive
+    /// cpufreq-bouncing transitions only on an actual on<->off change.
+    last_screen_on: Option<bool>,
 }
 
 impl OplusContext {
@@ -108,6 +127,7 @@ impl OplusContext {
             current_pkg: String::new(),
             current_pid: None,
             current_thermal_level: 0,
+            last_screen_on: None,
         }
     }
 
@@ -116,6 +136,28 @@ impl OplusContext {
     pub fn tick(&mut self) {
         // No-op for per-app config to eliminate filesystem I/O
         self.per_app.poll();
+        self.update_bouncing_for_screen();
+    }
+
+    /// Drive cpufreq bouncing off the screen state. Screen-off clamps
+    /// sustained background load harder (battery, no UX cost); screen-on
+    /// restores the gentle profile. Skipped while a game is active -- gaming
+    /// already disables bouncing and we must not re-enable it mid-game.
+    fn update_bouncing_for_screen(&mut self) {
+        let screen_on = read_screen_on();
+        if self.last_screen_on == Some(screen_on) {
+            return; // only act on an actual transition
+        }
+        self.last_screen_on = Some(screen_on);
+
+        if self.frame_boost.is_in_game() {
+            return; // gaming owns the bouncing state
+        }
+        if screen_on {
+            self.thermal_gov.set_screen_on_mode();
+        } else {
+            self.thermal_gov.set_screen_off_mode();
+        }
     }
 
     /// Feed temperature sensor data to horae skin temperature driver

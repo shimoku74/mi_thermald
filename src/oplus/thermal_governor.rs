@@ -165,6 +165,39 @@ impl ThermalGovernor {
         }
     }
 
+    /// Screen-off: clamp cpufreq bouncing hard. While the panel is off nobody
+    /// perceives interactive responsiveness, so damping sustained background
+    /// load (sync, downloads, media transcode) to curb needless high-clock
+    /// residency is a pure battery win with zero UX cost. Does NOT lower any
+    /// frequency ceiling or idle clock -- it only makes the kernel's existing
+    /// bouncing limiter act sooner on genuinely sustained background load.
+    pub fn set_screen_off_mode(&mut self) {
+        if !self.cpufreq_bouncing_available {
+            return;
+        }
+        write_node_str(CB_ENABLE, "1
+");
+        write_node_str(CB_DECAY, "20
+"); // fast accumulation -> earlier clamp of sustained bg load
+        self.current_bouncing_state = true;
+        log_debug!("oplus/thermal_governor: cpufreq bouncing -> screen-off (decay=20)");
+    }
+
+    /// Screen-on (interactive, not gaming): restore the normal gentle bouncing
+    /// so foreground sustained load keeps its clocks. Callers must not invoke
+    /// this while a game is active (gaming disables bouncing entirely).
+    pub fn set_screen_on_mode(&mut self) {
+        if !self.cpufreq_bouncing_available {
+            return;
+        }
+        write_node_str(CB_ENABLE, "1
+");
+        write_node_str(CB_DECAY, "50
+");
+        self.current_bouncing_state = true;
+        log_debug!("oplus/thermal_governor: cpufreq bouncing -> screen-on normal (decay=50)");
+    }
+
     /// Apply aggressive thermal damping during high temperature events
     pub fn set_thermal_throttle_mode(&mut self) {
         if !self.cpufreq_bouncing_available {
