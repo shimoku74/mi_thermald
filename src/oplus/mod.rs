@@ -20,6 +20,7 @@ pub mod midas;
 pub mod network;
 pub mod game_opt;
 pub mod net_qos;
+pub mod wifi_latency;
 
 pub use per_app_thermal::PerAppThermal;
 pub use frame_boost::FrameBoostController;
@@ -32,6 +33,7 @@ pub use midas::MidasController;
 pub use network::RouterBoost;
 pub use game_opt::GameOptController;
 pub use net_qos::{GameFirst, NetScore};
+pub use wifi_latency::WifiLatencyMode;
 
 use crate::sensor::sysfs;
 use std::os::unix::fs::MetadataExt;
@@ -88,6 +90,7 @@ pub struct OplusContext {
     pub game_opt: GameOptController,
     pub game_first: GameFirst,
     pub net_score: NetScore,
+    pub wifi_latency: WifiLatencyMode,
     pub is_lahaina: bool,
     pub current_pkg: String,
     pub current_pid: Option<i32>,
@@ -116,6 +119,7 @@ impl OplusContext {
         let game_opt = GameOptController::new();
         let game_first = GameFirst::new();
         let net_score = NetScore::new();
+        let wifi_latency = WifiLatencyMode::new();
 
         // Hook SurfaceFlinger and RenderEngine on startup
         tracker.hook_surfaceflinger(&frame_boost, &sched);
@@ -138,6 +142,7 @@ impl OplusContext {
             game_opt,
             game_first,
             net_score,
+            wifi_latency,
             is_lahaina,
             current_pkg: String::new(),
             current_pid: None,
@@ -153,6 +158,8 @@ impl OplusContext {
         // No-op for per-app config to eliminate filesystem I/O
         self.per_app.poll();
         self.update_bouncing_for_screen();
+        // re-arm wifi low latency on every wlan0 reconnect
+        self.wifi_latency.tick();
     }
 
     /// Drive cpufreq bouncing off the screen state. Screen-off clamps
