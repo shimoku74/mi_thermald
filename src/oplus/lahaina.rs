@@ -185,26 +185,29 @@ impl LahainaTuner {
         self.mode = LahainaTuningMode::Game;
         log_info!("oplus/lahaina: switching to GAMING profile (120Hz/unconstrained)");
 
-        // Uncap maximum frequencies
+        // lift all freq ceilings -- let the game hit max clocks whenever it needs to
         self.set_max("policy0", FREQ_SILVER_MAX);
         self.set_max("policy4", FREQ_GOLD_MAX);
         self.set_max("policy7", FREQ_PRIME_MAX);
 
-        // Fast schedutil up-ramp
+        // zero delay up-ramp: schedutil hits full speed on first demand tick --
+        // any positive value here causes visible latency on fast input bursts
         write_node_int(SUTIL_UP_RATE_SILVER, 0);
         write_node_int(SUTIL_UP_RATE_GOLD, 0);
         write_node_int(SUTIL_UP_RATE_PRIME, 0);
 
-        // Hold high frequency for 20ms across frames
+        // 20ms hold-down: keeps clocks up across a full frame budget so we don't
+        // ramp down between gpu submit and the next cpu frame start
         write_node_int(SUTIL_DW_RATE_SILVER, 20_000);
         write_node_int(SUTIL_DW_RATE_GOLD, 20_000);
         write_node_int(SUTIL_DW_RATE_PRIME, 20_000);
 
-        // Responsive WALT migration
+        // lower upmigration threshold: render threads move to big cores faster --
+        // 65/55 is the sweet spot for gaming; default 80/60 is too slow for 120hz
         write_node_int(WALT_UPMIGRATE, 65);
         write_node_int(WALT_DOWNMIGRATE, 55);
-        write_node_int(WALT_SCHED_BOOST, 1);
-        write_node_int(WALT_CPU_MULTI_THREAD, 1);
+        write_node_int(WALT_SCHED_BOOST, 1); // boost all tasks' util signal slightly
+        write_node_int(WALT_CPU_MULTI_THREAD, 1); // allow game engine worker spread
         write_node_int("/proc/sys/kernel/sched_util_clamp_min", 0);
     }
 
@@ -220,6 +223,8 @@ impl LahainaTuner {
         self.mode = LahainaTuningMode::Normal;
         log_info!("oplus/lahaina: switching to NORMAL balanced profile");
 
+        // uncap all clusters to ceiling -- kernel's own schedutil handles throttle
+        // we don't artificially limit clocks in normal mode, that's what cpufreq_bouncing is for
         self.set_max("policy0", FREQ_SILVER_MAX);
         self.set_max("policy4", FREQ_GOLD_MAX);
         self.set_max("policy7", FREQ_PRIME_MAX);
@@ -285,11 +290,13 @@ impl LahainaTuner {
         self.mode = LahainaTuningMode::Idle;
         log_info!("oplus/lahaina: switching to IDLE profile (screen off)");
 
+        // screen's off, nobody cares about latency -- clamp the shit out of all clusters
+        // silver @ 1.2 GHz covers alarms/syncs fine; gold/prime at 1.6/1.38 for any bg wake
         self.set_max("policy0", FREQ_SILVER_THROTTLE);
         self.set_max("policy4", FREQ_GOLD_THROTTLE_L2);
         self.set_max("policy7", FREQ_PRIME_THROTTLE_L2);
 
-        write_node_int(WALT_SCHED_BOOST, 0);
+        write_node_int(WALT_SCHED_BOOST, 0); // no boost while idle, nothing to boost for
     }
 
     /// Dynamic thermal step adaptation based on thermal level

@@ -66,6 +66,8 @@ impl PerAppThermal {
 
     /// Load config from disk exactly once across known paths
     fn load_once(&mut self) {
+        // try paths in order -- vendor partition first, then /data fallback for user installs
+        // stops at the first one that exists and parses successfully; no multi-file merge
         for &path in PER_APP_CONFIG_PATHS {
             if Path::new(path).exists() {
                 match fs::read_to_string(path) {
@@ -154,10 +156,11 @@ impl PerAppThermal {
         for (line_no, raw_line) in content.lines().enumerate() {
             let line = raw_line.trim();
             if line.is_empty() || line.starts_with('#') {
-                continue;
+                continue; // blank lines and # comments are both silently skipped
             }
 
-            // Expected format: <package>=<mode>=<hint>
+            // format: <package>=<mode>=<hint>  (third field is optional)
+            // e.g. com.miHoYo.GenshinImpact=game=nocap
             let parts: Vec<&str> = line.split('=').collect();
             if parts.len() < 2 {
                 log_debug!("oplus/per_app: line {}: invalid syntax '{}'", line_no + 1, line);

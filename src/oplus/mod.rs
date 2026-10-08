@@ -293,7 +293,8 @@ impl OplusContext {
         log_info!("oplus: thermal level transition -> {}", level);
 
         if level > 0 {
-            // Check if active app requests bypassing CPU cap
+            // nocap packages (e.g. genshin) specifically opted out of thermal caps --
+            // honor that even when the SoC is hot; they manage their own workload
             if self.frame_boost.is_in_game() && self.per_app.skip_cpu_cap(&self.current_pkg) {
                 log_info!("oplus: package '{}' has nocap hint; maintaining game clocks", self.current_pkg);
                 return;

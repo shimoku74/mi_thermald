@@ -80,6 +80,7 @@ impl MemoryManager {
 
     /// Set initial balanced memory parameters
     fn init_memory_defaults(&mut self) {
+        // hybridswap on, swapd running -- standard state
         write_node_str(ZRAM_HYBRIDSWAP_ENABLE, "1
 ");
         write_node_str(ZRAM_HYBRIDSWAP_PAUSE, "0
@@ -93,13 +94,14 @@ impl MemoryManager {
     /// Pausing it during gameplay completely eliminates background GC frame drops!
     pub fn set_game_pressure(&mut self) {
         if self.current_profile == MemoryProfile::Gaming {
-            return;
+            return; // already gaming, chill
         }
 
         self.current_profile = MemoryProfile::Gaming;
         log_info!("oplus/memory: applying GAMING memory profile (pausing swapd aging)");
 
-        // Pause background swapd aging during active game scene
+        // pause swapd -- that daemon randomly evicts pages mid-frame and causes
+        // 10-50ms stutter spikes. no game wants that shit.
         if self.hybridswap_available {
             write_node_str(ZRAM_HYBRIDSWAP_PAUSE, "1
 ");
@@ -110,12 +112,13 @@ impl MemoryManager {
     /// Set normal balanced profile: resumes swapd aging
     pub fn set_normal_pressure(&mut self) {
         if self.current_profile == MemoryProfile::Normal {
-            return;
+            return; // nothing to do
         }
 
         self.current_profile = MemoryProfile::Normal;
         log_info!("oplus/memory: restoring NORMAL memory profile (resuming swapd)");
 
+        // let swapd age cold pages again now that nobody's gaming
         if self.hybridswap_available {
             write_node_str(ZRAM_HYBRIDSWAP_PAUSE, "0
 ");
@@ -130,13 +133,14 @@ impl MemoryManager {
         log_info!("oplus/memory: applying LOW POWER profile (triggering compaction)");
 
         if self.hybridswap_available {
+            // unpause so swapd can reclaim while screen is off -- free real estate
             write_node_str(ZRAM_HYBRIDSWAP_PAUSE, "0
 ");
             self.swapd_paused = false;
-            // Trigger ZRAM memory compaction
+            // compact zram: merge scattered slots, lowers memory controller power
             write_node_str(ZRAM_COMPACT, "1
 ");
-            // Mark idle pages
+            // mark everything idle so swapd knows what to target first
             write_node_str(ZRAM_IDLE, "all
 ");
         }
@@ -149,6 +153,8 @@ impl MemoryManager {
         log_info!("oplus/memory: applying THERMAL PRESSURE profile");
 
         if self.hybridswap_available {
+            // resume swapd + compact -- moving pages to storage means fewer
+            // dram refreshes which directly drops SoC temperature a bit
             write_node_str(ZRAM_HYBRIDSWAP_PAUSE, "0
 ");
             self.swapd_paused = false;

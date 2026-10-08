@@ -59,10 +59,11 @@ impl ProcessTracker {
     ) {
         let sf_pid = match self.surfaceflinger_pid.or_else(|| self.discover_surfaceflinger()) {
             Some(p) => p,
-            None => return,
+            None => return, // surfaceflinger not up yet -- will retry on next hook call
         };
 
-        // Set SurfaceFlinger IM_FLAG in sched_assist
+        // im_flag tells the kernel scheduler "this process is part of the composition stack"
+        // so it gets priority inheritance through binder calls from apps to sf
         sched.set_im_flag(sf_pid, IM_FLAG_SURFACEFLINGER);
         sched.set_task_ux_state(sf_pid, SA_TYPE_ANIMATOR | SA_OPT_SET);
 
@@ -76,6 +77,8 @@ impl ProcessTracker {
                 sched.set_thread_ux_state(thread.tid, SA_TYPE_ANIMATOR | SA_OPT_SET);
                 log_info!("oplus/process_tracker: hooked SurfaceFlinger main tid={}", thread.tid);
             } else if comm_lower.contains("renderengine") || comm_lower.contains("re-") {
+                // renderengine does gpu composition -- it needs the prime core, period.
+                // without this it gets preempted by silver cluster garbage mid-frame
                 fb.add_frame_task(FrameTaskRole::RenderEngine, sf_pid, thread.tid);
                 fb.set_task_preferred_cluster(thread.tid, CLUSTER_PRIME);
                 sched.set_im_flag(thread.tid, IM_FLAG_RENDERENGINE);
@@ -139,7 +142,9 @@ impl ProcessTracker {
                 continue;
             }
 
-            // Game Engine Workers: Unity, Unreal, Frostbite, Vulkan/GL renderers
+            // game engine workers: unity/unreal name their threads predictably enough
+            // to match here -- gfx, gamethread, glthread, jobworker all live in the
+            // hot path. gold cluster so they don't starve the render thread on prime
             if comm_lower.contains("unity")
                 || comm_lower.contains("gfx")
                 || comm_lower.contains("gamethread")
@@ -167,15 +172,17 @@ impl ProcessTracker {
     /// Clear game hooks on game exit
     pub fn clear_game_hooks(&mut self, fb: &mut FrameBoostController) {
         if self.current_game_pid.is_none() {
-            return;
+            return; // nothing to clean up, game was never hooked
         }
 
         log_info!("oplus/process_tracker: clearing game process hooks");
+        // remove every game task from the kernel frame group before clearing our list --
+        // failing to do this leaks dead tids into the kernel's group until reboot
         for &tid in &self.hooked_game_tids {
             fb.remove_game_task(tid);
         }
         self.hooked_game_tids.clear();
-        self.game_render_tids.clear();
+        self.game_render_tids.clear(); // also drop render tids, game_opt will clear its side
         self.current_game_pid = None;
     }
 

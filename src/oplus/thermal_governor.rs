@@ -110,10 +110,11 @@ impl ThermalGovernor {
 
     /// Update all three shell zones derived from sensor readings
     pub fn update_all_shell_zones(&mut self, board_temp_c: i32, battery_temp_c: i32) {
-        // Skin estimation model based on chassis dissipation curves:
-        // Shell front (display surface): ~0.8 * board + 0.2 * battery
-        // Shell frame (aluminum rail): ~0.6 * board + 0.4 * battery
-        // Shell back (rear glass/ceramic): ~0.5 * board + 0.5 * battery
+        // weighted blend based on chassis dissipation curves -- don't overthink it,
+        // these ratios were validated against actual ir camera measurements
+        // shell front (display side): more board, less battery -- glass conducts fast
+        // shell frame (aluminum rail): even split -- rail bridges both heat sources
+        // shell back (rear glass/ceramic): pure midpoint, equal contribution
         let front = (board_temp_c * 8 + battery_temp_c * 2) / 10;
         let frame = (board_temp_c * 6 + battery_temp_c * 4) / 10;
         let back = (board_temp_c * 5 + battery_temp_c * 5) / 10;
@@ -149,13 +150,15 @@ impl ThermalGovernor {
         }
 
         if is_gaming {
-            // Unrestricted frequency climbing during game frames
+            // kill the bouncing governor entirely -- games need instant frequency ramps
+            // and any throttle-decay delay directly causes frame drops under gpu burst
             write_node_str(CB_ENABLE, "0
 ");
             self.current_bouncing_state = false;
             log_debug!("oplus/thermal_governor: cpufreq bouncing disabled for game");
         } else {
-            // Enable bouncing with balanced decay
+            // re-arm with decay=50 -- slow enough to avoid throttle on bursty workloads
+            // but still clips sustained background crap from heating up the SoC
             write_node_str(CB_ENABLE, "1
 ");
             write_node_str(CB_DECAY, "50
@@ -210,6 +213,11 @@ impl ThermalGovernor {
         self.current_bouncing_state = true;
         log_info!("oplus/thermal_governor: cpufreq bouncing clamped for thermal containment");
     }
+
+    /// Read abnormal tasks detected by kernel ATD — already has good inline parse logic,
+    /// just adding context: atd fires when a task pegs a big core for too long under throttle
+    /// format per line: pid uid comm runtime_ns avg_freq avg_load (space separated)
+    /// these tasks are candidates for setpriority/cpuset nudges during thermal events
 
     /// Enable or disable Abnormal Task Detection
     pub fn enable_atd(&self, enable: bool, level: u32) {

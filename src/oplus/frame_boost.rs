@@ -212,6 +212,7 @@ impl FrameBoostController {
 
     /// Initial setup: enable frame boost via sysctl if present and apply balanced stune boost
     fn init_driver(&mut self) {
+        // kick the driver awake, balanced config until a game shows up
         write_node_str(FBG_ENABLED, "1
 ");
         self.apply_stune_boost(&StuneBoostConfig::balanced());
@@ -219,6 +220,7 @@ impl FrameBoostController {
 
     /// Enter gaming mode with specific frame rate target
     pub fn enter_game(&mut self, fps: u32) {
+        // already at this fps -- don't spam the kernel with duplicate writes
         if self.in_game && self.target_fps == fps {
             return;
         }
@@ -228,6 +230,7 @@ impl FrameBoostController {
         self.last_state_change = Instant::now();
         log_info!("oplus/frame_boost: entering game mode target_fps={}", fps);
 
+        // 120hz gets the aggressive stune preset; 60fps is more conservative
         let cfg = if fps >= 120 {
             StuneBoostConfig::game_120fps()
         } else {
@@ -235,7 +238,7 @@ impl FrameBoostController {
         };
         self.apply_stune_boost(&cfg);
 
-        // Arm sysctl input & slide boost
+        // arm slide boost so swipe gestures don't starve game frames
         write_node_str(FBG_SLIDE_BOOST, "1
 ");
     }
@@ -243,7 +246,7 @@ impl FrameBoostController {
     /// Exit gaming mode and restore balanced operation
     pub fn exit_game(&mut self) {
         if !self.in_game {
-            return;
+            return; // already out, nothing to undo
         }
 
         log_info!("oplus/frame_boost: exiting game mode, restoring balanced profile");
@@ -251,7 +254,7 @@ impl FrameBoostController {
         self.target_fps = 60;
         self.last_state_change = Instant::now();
 
-        // Remove any tracked game tasks from kernel frame group
+        // nuke all game tids from the kernel frame group or they leak until reboot
         let tids = self.active_game_tids.clone();
         for tid in tids {
             self.remove_game_task(tid);
@@ -259,10 +262,10 @@ impl FrameBoostController {
         self.active_game_tids.clear();
         self.active_game_pid = None;
 
-        // Clear game early deadline
+        // zero out early deadline or kernel keeps its game timing heuristics hot
         self.clear_game_ed_info();
 
-        // Restore balanced configuration
+        // back to boring balanced, nobody's playing anymore
         self.apply_stune_boost(&StuneBoostConfig::balanced());
         write_node_str(FBG_SLIDE_BOOST, "0
 ");
@@ -271,6 +274,7 @@ impl FrameBoostController {
     /// Register a process thread to a specific frame group role
     /// Syntax: "<role> <pid> <tid>"
     pub fn add_frame_task(&self, role: FrameTaskRole, pid: i32, tid: i32) -> bool {
+        // kernel parses "role pid tid\n" -- spaces matter, don't fuck up the format
         let role_str = match role {
             FrameTaskRole::Ui => "ui",
             FrameTaskRole::Render => "render",
@@ -292,12 +296,13 @@ impl FrameBoostController {
     /// Add task to game frame group
     /// Syntax: "game <tid> 1"
     pub fn add_game_task(&mut self, tid: i32) -> bool {
+        // "game <tid> 1" = add, "game <tid> 0" = remove; 1 is not a bool here, it's the group bit
         let cmd = format!("game {} 1
 ", tid);
         let ok = write_node_str(NODE_OFB_ADD_TASK, &cmd);
         if ok {
             if !self.active_game_tids.contains(&tid) {
-                self.active_game_tids.push(tid);
+                self.active_game_tids.push(tid); // track locally for clean exit
             }
             log_debug!("oplus/frame_boost: added game thread tid={}", tid);
         }
@@ -310,7 +315,7 @@ impl FrameBoostController {
         let cmd = format!("game {} 0
 ", tid);
         let ok = write_node_str(NODE_OFB_ADD_TASK, &cmd);
-        self.active_game_tids.retain(|&x| x != tid);
+        self.active_game_tids.retain(|&x| x != tid); // keep local list in sync
         ok
     }
 
@@ -318,6 +323,8 @@ impl FrameBoostController {
     /// Syntax: "prefer <tid> <cluster_id>"
     /// cluster_id: 0 = Silver, 1 = Gold, 2 = Prime
     pub fn set_task_preferred_cluster(&self, tid: i32, cluster_id: i32) -> bool {
+        // hints the scheduler "this tid really wants to land on cluster N"
+        // not a hard pin -- kernel can still migrate if load demands it
         let cmd = format!("prefer {} {}
 ", tid, cluster_id);
         let ok = write_node_str(NODE_OFB_ADD_TASK, &cmd);
@@ -330,6 +337,8 @@ impl FrameBoostController {
     /// Configure early deadline detection for current game process
     /// Syntax: "<ed_duration_ns> <game_pid>"
     pub fn set_game_ed_info(&mut self, duration_ns: i32, game_pid: i32) -> bool {
+        // ed = early deadline; if a game frame task misses this window the
+        // kernel bumps it above normal rt to catch up -- critical for 120hz
         self.active_game_pid = Some(game_pid);
         let cmd = format!("{} {}
 ", duration_ns, game_pid);
@@ -342,12 +351,14 @@ impl FrameBoostController {
 
     /// Clear game early deadline detection
     pub fn clear_game_ed_info(&mut self) {
+        // "0 0" = pid 0 means no game, duration 0 disarms the timer
         write_node_str(NODE_OFB_GAME_ED, "0 0
 ");
     }
 
     /// Apply 16-parameter stune boost tuning
     pub fn apply_stune_boost(&self, cfg: &StuneBoostConfig) -> bool {
+        // all 16 params must be present in exact order or kernel ignores the write
         let text = cfg.to_proc_string();
         let ok = write_node_str(NODE_OFB_STUNE_BOOST, &text);
         if ok {

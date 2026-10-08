@@ -123,17 +123,19 @@ impl SchedAssist {
 
     /// Set initial recommended kernel parameters
     fn init_driver_defaults(&mut self) {
+        // boot sequence -- get everything in a known good state before apps launch
         self.set_sched_assist_enabled(true);
         self.set_frame_boost_enabled(true);
-        self.set_frame_rate(60);
-        self.set_boost_task_threshold(102);
-        self.set_audio_perf(true);
-        self.set_binder_async_ux(true);
+        self.set_frame_rate(60); // safe default; overridden on game enter
+        self.set_boost_task_threshold(102); // ~40% util before boosting kicks in
+        self.set_audio_perf(true); // keep audio rt latency path always armed
+        self.set_binder_async_ux(true); // async binder inherits caller ux prio
     }
 
     /// Master switch for sched_assist in kernel
     pub fn set_sched_assist_enabled(&self, enable: bool) -> bool {
         let val = if enable { 1 } else { 0 };
+        // try new procfs path, fall back to legacy sysctl if kernel is older
         if write_node_int(NODE_SA_ENABLED, val) {
             return true;
         }
@@ -143,9 +145,10 @@ impl SchedAssist {
     /// Set current active scheduler scene bitmask
     pub fn set_scene(&mut self, scene: u32) {
         if self.current_scene == scene {
-            return;
+            return; // no change, skip the write
         }
         self.current_scene = scene;
+        // new procfs path preferred; sysctl fallback for older okx builds
         if !write_node_int(NODE_SA_SCENE, scene as i32) {
             write_node_int(SYSCTL_SA_SCENE, scene as i32);
         }
@@ -173,6 +176,8 @@ impl SchedAssist {
 
     /// Gaming scene: GPU composition + Animation + Slide priority
     pub fn set_game_scene(&mut self, target_fps: u32) {
+        // full combo: gpu comp + anim + slide + input -- stops render threads
+        // getting evicted from big cores by random background garbage
         self.set_frame_rate(target_fps);
         self.set_scene(SA_GPU_COMPOSITION | SA_ANIM | SA_SLIDE | SA_INPUT);
         self.set_slide_boost(true);
@@ -181,29 +186,35 @@ impl SchedAssist {
 
     /// Smooth scrolling scene: Slide + Animation + Input
     pub fn set_scroll_scene(&mut self) {
+        // shade/list scroll -- animation + input without full gpu comp overhead
         self.set_scene(SA_SLIDE | SA_ANIM | SA_INPUT);
         self.set_slide_boost(true);
     }
 
     /// App launch scene: High priority fast ramp
     pub fn set_launch_scene(&mut self) {
+        // cold launch: ramp fast, user just tapped and they're waiting
         self.set_scene(SA_LAUNCH | SA_ANIM_START | SA_ANIM);
         self.set_input_boost(true);
     }
 
     /// Camera recording / preview scene
     pub fn set_camera_scene(&mut self) {
+        // isp pipelines are heavy -- needs gpu comp scene to avoid viewfinder drops
         self.set_scene(SA_CAMERA | SA_GPU_COMPOSITION);
     }
 
     /// Arms kernel 1.5s hrtimer input boost and triggers cpufreq update
     pub fn set_input_boost(&mut self, enable: bool) {
+        // fires a hrtimer on each touch event; disabling won't cancel in-flight ones
         self.input_boost_active = enable;
         write_node_int(NODE_INPUT_BOOST, if enable { 1 } else { 0 });
     }
 
     /// Toggles slide boost (migrates heavy UX tasks to non-interfering big/prime cores)
     pub fn set_slide_boost(&mut self, enable: bool) {
+        // tells scheduler to prefer big cores for ux tasks during scroll --
+        // without this silver cluster starves the render thread on fast flings
         self.slide_boost_active = enable;
         write_node_int(NODE_SLIDE_BOOST, if enable { 1 } else { 0 });
     }
