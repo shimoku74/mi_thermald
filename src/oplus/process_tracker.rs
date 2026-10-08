@@ -26,6 +26,8 @@ pub struct ProcessTracker {
     sf_renderengine_tids: Vec<i32>,
     current_game_pid: Option<i32>,
     hooked_game_tids: Vec<i32>,
+    // render-only subset of hooked_game_tids; handed to game_opt for rt_info
+    game_render_tids: Vec<i32>,
 }
 
 impl ProcessTracker {
@@ -35,6 +37,7 @@ impl ProcessTracker {
             sf_renderengine_tids: Vec::new(),
             current_game_pid: None,
             hooked_game_tids: Vec::new(),
+            game_render_tids: Vec::new(),
         };
         tracker.discover_surfaceflinger();
         tracker
@@ -99,6 +102,7 @@ impl ProcessTracker {
 
         self.current_game_pid = Some(pid);
         self.hooked_game_tids.clear();
+        self.game_render_tids.clear(); // fresh list per game session
         log_info!("oplus/process_tracker: analyzing game process pid={}", pid);
 
         // Set high priority UX state on game process
@@ -129,6 +133,8 @@ impl ProcessTracker {
                 sched.set_thread_ux_state(thread.tid, SA_TYPE_HEAVY | SA_OPT_SET);
                 fb.add_game_task(thread.tid);
                 self.hooked_game_tids.push(thread.tid);
+                // stash for game_opt rt_info registration (kernel waker tracking)
+                self.game_render_tids.push(thread.tid);
                 log_info!("oplus/process_tracker: registered game RenderThread tid={}", thread.tid);
                 continue;
             }
@@ -169,7 +175,13 @@ impl ProcessTracker {
             fb.remove_game_task(tid);
         }
         self.hooked_game_tids.clear();
+        self.game_render_tids.clear();
         self.current_game_pid = None;
+    }
+
+    /// render thread TIDs found during last hook_game_process call (max 2 for game_opt)
+    pub fn render_thread_tids(&self) -> &[i32] {
+        &self.game_render_tids
     }
 
     pub fn current_game_pid(&self) -> Option<i32> {

@@ -108,12 +108,38 @@ impl LahainaTuner {
             log_warn!("oplus/lahaina: cpufreq policy paths missing, running in virtual mode");
         }
 
-        LahainaTuner {
+        let tuner = LahainaTuner {
             mode: LahainaTuningMode::Normal,
             is_available: avail,
             has_policy0,
             has_policy4,
             has_policy7,
+        };
+
+        // one-shot touch boost init -- silver cluster gets a beefy floor so
+        // dragging the shade / opening blur overlays doesn't stutter mid-animation
+        // touch_boost sysfs lives under the cpuN device kobj, not cpufreq/policyN
+        tuner.init_touch_boost();
+
+        tuner
+    }
+
+    /// configure oplus touch_boost for all clusters at startup.
+    /// silver needs the most help -- UI threads live there and the default
+    /// 1.3 GHz boost is borderline for heavy blur compositing.
+    fn init_touch_boost(&self) {
+        // silver (cpu0): bump to 1574400 kHz, keep 150ms window
+        // gold/prime (cpu4/cpu7): leave at 0 -- they're already responsive via
+        // schedutil and we don't want wasted energy on every tap
+        const TB_SILVER_FREQ: &str =
+            "/sys/devices/system/cpu/cpu0/touch_boost/touch_boost_freq";
+        const TB_SILVER_MS: &str =
+            "/sys/devices/system/cpu/cpu0/touch_boost/touch_boost_ms";
+
+        if Path::new(TB_SILVER_FREQ).exists() {
+            write_node_str(TB_SILVER_FREQ, "1574400\n");
+            write_node_str(TB_SILVER_MS, "150\n");
+            log_info!("oplus/lahaina: touch_boost silver -> 1574400 kHz / 150ms");
         }
     }
 
@@ -282,6 +308,16 @@ impl LahainaTuner {
 
     pub fn is_available(&self) -> bool {
         self.is_available
+    }
+}
+
+fn write_node_str(path: &str, val: &str) -> bool {
+    if !Path::new(path).exists() {
+        return false;
+    }
+    match OpenOptions::new().write(true).open(path) {
+        Ok(mut f) => f.write_all(val.as_bytes()).is_ok(),
+        Err(_) => false,
     }
 }
 

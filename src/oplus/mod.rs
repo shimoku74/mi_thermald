@@ -18,6 +18,7 @@ pub mod process_tracker;
 pub mod netlink;
 pub mod midas;
 pub mod network;
+pub mod game_opt;
 
 pub use per_app_thermal::PerAppThermal;
 pub use frame_boost::FrameBoostController;
@@ -28,6 +29,7 @@ pub use lahaina::LahainaTuner;
 pub use process_tracker::ProcessTracker;
 pub use midas::MidasController;
 pub use network::RouterBoost;
+pub use game_opt::GameOptController;
 
 use crate::sensor::sysfs;
 use std::os::unix::fs::MetadataExt;
@@ -81,6 +83,7 @@ pub struct OplusContext {
     pub tracker: ProcessTracker,
     pub midas: MidasController,
     pub router: RouterBoost,
+    pub game_opt: GameOptController,
     pub is_lahaina: bool,
     pub current_pkg: String,
     pub current_pid: Option<i32>,
@@ -104,6 +107,7 @@ impl OplusContext {
         let mut tracker = ProcessTracker::new();
         let midas = MidasController::new();
         let router = RouterBoost::new();
+        let game_opt = GameOptController::new();
 
         // Hook SurfaceFlinger and RenderEngine on startup
         tracker.hook_surfaceflinger(&frame_boost, &sched);
@@ -123,6 +127,7 @@ impl OplusContext {
             tracker,
             midas,
             router,
+            game_opt,
             is_lahaina,
             current_pkg: String::new(),
             current_pid: None,
@@ -201,7 +206,14 @@ impl OplusContext {
             self.current_pid = Some(pid);
             self.tracker.hook_game_process(pid, &mut self.frame_boost, &self.sched, fps);
 
-            // 7. RouterBoost: mark this app's uid as the active game so the
+            // 7. GameOpt: register pid + apply cpu floors for gold/prime clusters,
+            //    then pass render TIDs for kernel-side waker tracking
+            self.game_opt.register_game(pid);
+            self.game_opt.set_cpu_floors();
+            let render_tids = self.tracker.render_thread_tids().to_vec();
+            self.game_opt.set_render_threads(&render_tids);
+
+            // 8. RouterBoost: mark this app's uid as the active game so the
             // kernel's network stack prioritizes its traffic (lower latency
             // on the primary Wi-Fi interface). Network-only; does not touch
             // CPU frequency or scheduling.
@@ -221,22 +233,27 @@ impl OplusContext {
         // 1. Clear process hooks
         self.tracker.clear_game_hooks(&mut self.frame_boost);
 
-        // 2. RouterBoost: clear the game-playing flag (network QoS)
+        // 2. GameOpt: drop cpu floors first, then unregister pid
+        self.game_opt.clear_render_threads();
+        self.game_opt.clear_cpu_floors();
+        self.game_opt.unregister_game();
+
+        // 4. RouterBoost: clear the game-playing flag (network QoS)
         self.router.clear_game();
 
-        // 3. Frame Boost exit
+        // 5. Frame Boost exit
         self.frame_boost.exit_game();
 
-        // 3. Sched Assist clear scenes
+        // 6. Sched Assist clear scenes
         self.sched.clear_scene();
 
-        // 4. Thermal Governor re-enable balanced bouncing
+        // 7. Thermal Governor re-enable balanced bouncing
         self.thermal_gov.set_gaming_mode(false);
 
-        // 5. Memory Manager resume swapd
+        // 8. Memory Manager resume swapd
         self.memory.set_normal_pressure();
 
-        // 6. Hardware Tuner restore balanced caps
+        // 9. Hardware Tuner restore balanced caps
         if self.is_lahaina {
             self.tuner.apply_normal();
         }
