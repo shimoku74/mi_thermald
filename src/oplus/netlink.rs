@@ -160,10 +160,24 @@ impl GenlClient {
         None
     }
 
-    /// Fire a one-way genl message: `cmd` with a single u32 attribute
-    /// `attr_type` = `value`. Every routerboost setter is exactly this shape.
+    /// fire a one-way genl message: `cmd` with a single u32 attribute.
+    /// every routerboost setter is exactly this shape.
     pub fn send_u32(&mut self, cmd: u8, attr_type: u16, value: u32) -> bool {
-        let payload = value.to_ne_bytes();
+        self.send_raw(cmd, attr_type, &value.to_ne_bytes())
+    }
+
+    /// fire a one-way genl message with a u32 slice as the attribute payload.
+    /// used for multi-value attrs like game_first BATTLE_STATE (u32[3]) and
+    /// net_score ADD_UID (u32[count+1]).
+    pub fn send_u32_slice(&mut self, cmd: u8, attr_type: u16, values: &[u32]) -> bool {
+        let mut payload = Vec::with_capacity(values.len() * 4);
+        for &v in values {
+            payload.extend_from_slice(&v.to_ne_bytes());
+        }
+        self.send_raw(cmd, attr_type, &payload)
+    }
+
+    fn send_raw(&mut self, cmd: u8, attr_type: u16, payload: &[u8]) -> bool {
         let attr_total = NLA_HDRLEN + payload.len();
         let attr_aligned = nla_align(attr_total);
         let msg_len = NLMSGHDR_LEN + GENLMSGHDR_LEN + attr_aligned;
@@ -173,7 +187,7 @@ impl GenlClient {
         write_nlmsghdr(&mut buf, msg_len as u32, self.family_id, NLM_F_REQUEST, self.seq, 0);
         buf[NLMSGHDR_LEN] = cmd;
         buf[NLMSGHDR_LEN + 1] = 1;
-        write_nlattr(&mut buf, NLMSGHDR_LEN + GENLMSGHDR_LEN, attr_type, &payload);
+        write_nlattr(&mut buf, NLMSGHDR_LEN + GENLMSGHDR_LEN, attr_type, payload);
 
         unsafe { libc::send(self.fd, buf.as_ptr() as *const _, buf.len(), 0) >= 0 }
     }

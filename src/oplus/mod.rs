@@ -19,6 +19,7 @@ pub mod netlink;
 pub mod midas;
 pub mod network;
 pub mod game_opt;
+pub mod net_qos;
 
 pub use per_app_thermal::PerAppThermal;
 pub use frame_boost::FrameBoostController;
@@ -30,6 +31,7 @@ pub use process_tracker::ProcessTracker;
 pub use midas::MidasController;
 pub use network::RouterBoost;
 pub use game_opt::GameOptController;
+pub use net_qos::{GameFirst, NetScore};
 
 use crate::sensor::sysfs;
 use std::os::unix::fs::MetadataExt;
@@ -84,9 +86,13 @@ pub struct OplusContext {
     pub midas: MidasController,
     pub router: RouterBoost,
     pub game_opt: GameOptController,
+    pub game_first: GameFirst,
+    pub net_score: NetScore,
     pub is_lahaina: bool,
     pub current_pkg: String,
     pub current_pid: Option<i32>,
+    // uid of the running game; kept across exit for net_score remove_uid
+    pub current_game_uid: Option<u32>,
     pub current_thermal_level: i32,
     /// Last observed screen state (None until first tick), used to drive
     /// cpufreq-bouncing transitions only on an actual on<->off change.
@@ -108,6 +114,8 @@ impl OplusContext {
         let midas = MidasController::new();
         let router = RouterBoost::new();
         let game_opt = GameOptController::new();
+        let game_first = GameFirst::new();
+        let net_score = NetScore::new();
 
         // Hook SurfaceFlinger and RenderEngine on startup
         tracker.hook_surfaceflinger(&frame_boost, &sched);
@@ -128,9 +136,12 @@ impl OplusContext {
             midas,
             router,
             game_opt,
+            game_first,
+            net_score,
             is_lahaina,
             current_pkg: String::new(),
             current_pid: None,
+            current_game_uid: None,
             current_thermal_level: 0,
             last_screen_on: None,
         }
@@ -213,12 +224,17 @@ impl OplusContext {
             let render_tids = self.tracker.render_thread_tids().to_vec();
             self.game_opt.set_render_threads(&render_tids);
 
-            // 8. RouterBoost: mark this app's uid as the active game so the
-            // kernel's network stack prioritizes its traffic (lower latency
-            // on the primary Wi-Fi interface). Network-only; does not touch
-            // CPU frequency or scheduling.
+            // 8. Network QoS stack: all three genl drivers get the uid so every
+            //    network-layer optimization fires for this game session.
+            //    routerboost: wifi queue prioritization
+            //    game_first:  udp first-packet fast path
+            //    net_score:   per-link latency scoring for this uid
             if let Some(uid) = process_uid(pid) {
+                self.current_game_uid = Some(uid);
                 self.router.set_game(uid);
+                self.game_first.set_game_uid(uid);
+                self.game_first.enter_battle();
+                self.net_score.add_uid(uid);
             }
         }
     }
@@ -229,6 +245,7 @@ impl OplusContext {
 
         self.current_pkg.clear();
         self.current_pid = None;
+        let exiting_uid = self.current_game_uid.take();
 
         // 1. Clear process hooks
         self.tracker.clear_game_hooks(&mut self.frame_boost);
@@ -238,8 +255,12 @@ impl OplusContext {
         self.game_opt.clear_cpu_floors();
         self.game_opt.unregister_game();
 
-        // 4. RouterBoost: clear the game-playing flag (network QoS)
+        // 4. Network QoS stack: clear all three genl drivers
         self.router.clear_game();
+        self.game_first.exit_game();
+        if let Some(uid) = exiting_uid {
+            self.net_score.remove_uid(uid);
+        }
 
         // 5. Frame Boost exit
         self.frame_boost.exit_game();
