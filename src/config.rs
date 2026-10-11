@@ -209,11 +209,18 @@ fn resolve_block(
             if inst.actions.len() >= MI_MAX_DEVICES_PER_BLOCK * MI_MAX_LEVELS {
                 break;
             }
-            let idx = lvl * n_dev + d;
+            // Monitor/SS targets correspond to crossed thresholds. Level 0
+            // is the default, not target[0]. SIC uses its own PID segments.
+            let idx = if b.threshold.n_levels() > 0 && algo != AlgoType::Sic {
+                lvl.checked_sub(1).map(|l| l * n_dev + d)
+            } else {
+                Some(lvl * n_dev + d)
+            };
             let a = Action {
                 type_: device_to_action(&b.devices[d]),
                 target: b.devices[d].clone(),
-                value: if idx < n_tgt { b.threshold.target[idx] } else { 0 },
+                value: idx.filter(|&i| i < n_tgt)
+                    .map(|i| b.threshold.target[i]).unwrap_or(0),
             };
             inst.actions.push(a);
         }
@@ -451,6 +458,50 @@ pub fn resolve_scenario_path(fname: &str) -> Option<String> {
         return Some(chosen.to_string());
     }
     Some(scen_plain)
+}
+
+#[cfg(test)]
+mod threshold_tests {
+    use super::*;
+
+    #[test]
+    fn battery_monitor_releases_below_threshold_and_keeps_last_target() {
+        let mut block = ConfigBlock::default();
+        block.algo_str = "monitor".into();
+        block.devices = vec!["battery".into()];
+        block.threshold.trig = vec![37000, 38300];
+        block.threshold.clr = vec![36300, 37700];
+        block.threshold.target = vec![700, 805];
+        let mut instances = Vec::new();
+        let mut states = Vec::new();
+        resolve_block(&mut Vec::new(), &[], &mut instances, &mut states, &block);
+        let inst = &mut instances[0];
+        for (temp, target) in [(36000, 0), (37000, 700), (38300, 805),
+            (38000, 805), (37700, 700), (36300, 0)] {
+            let level = crate::algorithm::evaluate_instance(inst, temp, &mut states[0]);
+            assert_eq!(inst.actions[level as usize].value, target, "temp={temp}");
+        }
+    }
+
+    #[test]
+    fn compound_targets_stay_together_and_unconditional_targets_stay_active() {
+        let mut block = ConfigBlock::default();
+        block.algo_str = "monitor".into();
+        block.devices = vec!["cpu4".into(), "hotplug_cpu5".into()];
+        block.threshold.trig = vec![5000];
+        block.threshold.clr = vec![6000];
+        block.threshold.target = vec![1286400, 1];
+        let mut instances = Vec::new();
+        let mut states = Vec::new();
+        resolve_block(&mut Vec::new(), &[], &mut instances, &mut states, &block);
+        assert_eq!(instances[0].actions.iter().map(|a| a.value).collect::<Vec<_>>(),
+            vec![0, 0, 1286400, 1]);
+        block.threshold.trig.clear();
+        block.threshold.clr.clear();
+        instances.clear();
+        resolve_block(&mut Vec::new(), &[], &mut instances, &mut states, &block);
+        assert_eq!(instances[0].actions[0].value, 1286400);
+    }
 }
 
 fn load_single_scenario(

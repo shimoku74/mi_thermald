@@ -95,11 +95,54 @@ pub fn set_ipa_boost(level: i32) -> i32 {
     }
 }
 
-pub fn set_bcl(ma: i32) -> i32 {
-    log_debug!("set bcl to {}", ma);
-    let ok = sysfs::write_int("/sys/class/power_supply/battery/constant_charge_current", ma)
-        || sysfs::write_int("/sys/class/power_supply/battery/current_max", ma);
-    if ok { 0 } else { -1 }
+fn battery_cooling_level(value: i32) -> Option<i32> {
+    if value < 0 { return None; }
+    // Xiaomi monitor/battery targets pack two cooling levels in decimal
+    // (e.g. 807). They are not currents. Until charger-specific selection
+    // is available, retain the more restrictive level on either charger.
+    if value >= 100 {
+        let high = value / 100;
+        let low = value % 100;
+        if high > 15 || low > 15 { return None; }
+        Some(high.max(low))
+    } else if value <= 15 {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+pub fn set_bcl(value: i32) -> i32 {
+    let Some(level) = battery_cooling_level(value) else {
+        log_warn!("invalid battery cooling target {}", value);
+        return -1;
+    };
+    let path = "/sys/class/power_supply/battery/charge_control_limit";
+    let levels = sysfs::read_int("/sys/class/power_supply/battery/charge_control_limit_max");
+    if levels <= 0 || level >= levels {
+        log_warn!("battery cooling level {} outside device range {}", level, levels);
+        return -1;
+    }
+    if sysfs::write_int(path, level) { 0 } else {
+        log_warn!("failed to set battery cooling level {}", level);
+        -1
+    }
+}
+
+#[cfg(test)]
+mod charging_tests {
+    use super::battery_cooling_level;
+
+    #[test]
+    fn packed_battery_targets_are_cooling_states_not_currents() {
+        for (target, level) in [(0, 0), (7, 7), (700, 7), (805, 8),
+            (807, 8), (908, 9), (1209, 12), (1515, 15)] {
+            assert_eq!(battery_cooling_level(target), Some(level));
+        }
+        for target in [-1, 16, 899, 1600, 500000] {
+            assert_eq!(battery_cooling_level(target), None);
+        }
+    }
 }
 
 pub fn set_fcc(ma: i32) -> i32 {

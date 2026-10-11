@@ -231,12 +231,7 @@ impl AIEngine {
                 let v = crate::sensor::sysfs::read_int(&cpuinfo_max_path(&action.target));
                 if v > 0 { v } else { 3000000 }
             }
-            ActionType::Bcl => {
-                let v = crate::sensor::sysfs::read_int(
-                    "/sys/class/power_supply/battery/constant_charge_current"
-                );
-                if v > 0 { v } else { 5000000 }
-            }
+            ActionType::Bcl => 0,
             ActionType::Fcc => {
                 let v = crate::sensor::sysfs::read_int(
                     "/sys/class/power_supply/battery/constant_charge_current_max"

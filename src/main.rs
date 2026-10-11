@@ -161,12 +161,8 @@ fn resolve_default_action_value(action: &mut Action) {
             let v = sysfs::read_int(&path);
             action.value = if v > 0 { v } else { 1 };
         }
-        ActionType::Bcl => {
-            let v = sysfs::read_int(
-                "/sys/class/power_supply/battery/constant_charge_current"
-            );
-            action.value = if v > 0 { v } else { 5000000 };
-        }
+        // Zero releases the monitor/battery cooling vote; it is not an FCC.
+        ActionType::Bcl => {}
         ActionType::Fcc => {
             let mut v = sysfs::read_int(
                 "/sys/class/power_supply/battery/constant_charge_current_max"
