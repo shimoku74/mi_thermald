@@ -134,7 +134,8 @@ impl FeatureExtractor {
 
         // Extract device context
         let (battery_soc, is_charging, battery_current) = self.extract_battery_info(sensors);
-        let screen_on = 1.0; // TODO: Could be extracted from sensor if available
+        let brightness = crate::sensor::sysfs::read_int("/sys/class/backlight/panel0-backlight/brightness");
+        let screen_on = if brightness > 0 { 1.0_f32 } else { 0.0_f32 };
         let time_of_day = self.get_time_of_day();
 
         // Compute headroom

@@ -5,8 +5,8 @@ use super::tile_coding::TileCoding;
 const NUM_ACTIONS: u8 = 10;
 const LEARNING_RATE: f32 = 0.1;
 const DISCOUNT_FACTOR: f32 = 0.95;
-const EPSILON_START: f32 = 0.3;
-const EPSILON_MIN: f32 = 0.05;
+const EPSILON_START: f32 = 0.12;
+const EPSILON_MIN: f32 = 0.02;
 const EPSILON_DECAY_TICKS: u64 = 604_800;
 
 #[derive(Serialize, Deserialize)]

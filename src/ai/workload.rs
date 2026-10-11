@@ -64,6 +64,11 @@ impl WorkloadDetector {
         }
     }
 
+    /// Last detected mode — used by the caps layer after detect_workload() runs.
+    pub fn last_mode_for_caps(&self) -> WorkloadMode {
+        self.last_mode
+    }
+
     /// Enhanced workload detection with thermal profile support
     /// Checks sconfig node first for instant detection, falls back to sensor-based
     pub fn detect_workload(

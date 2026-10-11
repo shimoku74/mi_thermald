@@ -24,7 +24,7 @@ const BOOT_MAX_ACTION: u8 = 4;
 /// forces Compute action to 9) for this many additional ticks.  This avoids
 /// the cliff-edge where the boot phase ends and the still-hot CPU immediately
 /// gets pushed back to max performance, tripping the safety circuit breaker.
-const POST_BOOT_GRACE_TICKS: u64 = 90;
+const POST_BOOT_GRACE_TICKS: u64 = 30;
 
 const CHARGE_RATE_EMA_ALPHA: f32 = 0.3;
 const CHARGE_RATE_SAFE_C_PER_S: f32 = 0.03; // below this, no extra cap
@@ -269,7 +269,7 @@ impl NativeController {
             self.disabled_reason = None;
         }
 
-        let (group_actions, state, prev_state, prev_actions) = {
+        let (mut group_actions, state, prev_state, prev_actions) = {
             let model = self.scenario_models
                 .entry(self.current_scenario)
                 .or_insert_with(ScenarioModel::new);
@@ -418,6 +418,34 @@ impl NativeController {
             (group_actions, state, prev_state, prev_actions)
         };
 
+        // Deterministic workload ceilings — applied after Q-learning and battery
+        // temp ladder so context-obvious choices override exploration noise.
+        let screen_off = state.screen_on < 0.5;
+        let workload_mode_now = self.workload_detector.last_mode_for_caps();
+        for (&group, act) in group_actions.iter_mut() {
+            let ceil: u8 = match (screen_off, workload_mode_now) {
+                (true, _) => match group {
+                    ChannelGroup::Compute => 2,
+                    ChannelGroup::Thermal => 1,
+                    _ => 9,
+                },
+                (false, crate::ai::WorkloadMode::Idle) => match group {
+                    ChannelGroup::Compute => 3,
+                    ChannelGroup::Thermal => 3,
+                    _ => 9,
+                },
+                (false, crate::ai::WorkloadMode::Light) => match group {
+                    ChannelGroup::Compute => 7,
+                    ChannelGroup::Thermal => 7,
+                    _ => 9,
+                },
+                _ => 9,
+            };
+            if *act > ceil {
+                *act = ceil;
+            }
+        }
+
         self.apply_grouped_actions(&group_actions, sensor_readings);
 
         if let Some(ref ls) = prev_state {
@@ -524,30 +552,86 @@ impl NativeController {
             });
         }
 
-        // scaling_max_freq for each CPU cluster (direct frequency cap)
-        for &(policy, hw_max, var) in &[
-            (0, 2016000, &crate::CPU_FREQ0_TARGET),
-            (3, 2803200, &crate::CPU_FREQ3_TARGET),
-            (7, 3014400, &crate::CPU_FREQ7_TARGET),
-        ] {
-            let path = format!("/sys/devices/system/cpu/cpufreq/policy{}/scaling_max_freq", policy);
-            if std::path::Path::new(&path).exists() {
-                let cur = crate::sensor::sysfs::read_int(&path).max(0);
-                let cur = if cur > 0 { cur } else { hw_max };
-                // FIX BUG-004: Use Release ordering for cross-thread visibility
-                var.store(cur, std::sync::atomic::Ordering::Release);
-                self.channels.push(CoolingChannel {
-                    name: format!("cpu_freq{}", policy),
-                    path,
-                    action_type: ActionType::CpuFreq,
-                    group: ChannelGroup::Compute,
-                    value: cur,
-                    min_val: hw_max * 3 / 10,
-                    max_val: hw_max,
-                    pid: None,
-                    pid_state: SicState::default(),
-                    sensor_name: None,
-                });
+        // CPU cluster discovery: read all policy* dirs, sort by max_freq ascending
+        // → slot 0 = little, 1 = mid, 2 = prime. works on any SoC (not just 888/7325).
+        {
+            let target_vars: [&'static std::sync::atomic::AtomicI32; 3] = [
+                &crate::CPU_FREQ0_TARGET,
+                &crate::CPU_FREQ3_TARGET,
+                &crate::CPU_FREQ7_TARGET,
+            ];
+            let mut cpu_policies: Vec<(u32, i32)> = Vec::new();
+            if let Ok(entries) = fs::read_dir("/sys/devices/system/cpu/cpufreq") {
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if let Some(num) = name.strip_prefix("policy") {
+                        if let Ok(pid) = num.parse::<u32>() {
+                            let max_f = crate::sensor::sysfs::read_int(&format!(
+                                "/sys/devices/system/cpu/cpufreq/policy{}/cpuinfo_max_freq", pid
+                            ));
+                            if max_f > 0 {
+                                cpu_policies.push((pid, max_f));
+                            }
+                        }
+                    }
+                }
+            }
+            cpu_policies.sort_by_key(|&(_, f)| f);
+            for (slot, &(policy, hw_max)) in cpu_policies.iter().enumerate().take(3) {
+                let path = format!(
+                    "/sys/devices/system/cpu/cpufreq/policy{}/scaling_max_freq", policy
+                );
+                if std::path::Path::new(&path).exists() {
+                    let cur = crate::sensor::sysfs::read_int(&path).max(0);
+                    let cur = if cur > 0 { cur } else { hw_max };
+                    target_vars[slot].store(cur, std::sync::atomic::Ordering::Release);
+                    self.channels.push(CoolingChannel {
+                        name: format!("cpu_freq{}", policy),
+                        path,
+                        action_type: ActionType::CpuFreq,
+                        group: ChannelGroup::Compute,
+                        value: cur,
+                        min_val: hw_max * 3 / 10,
+                        max_val: hw_max,
+                        pid: None,
+                        pid_state: SicState::default(),
+                        sensor_name: None,
+                    });
+                    log_info!("AI-native: CPU cluster {} policy{} max={}kHz", slot, policy, hw_max);
+                }
+            }
+        }
+
+        // GPU cooling device via thermal-devfreq-0 (Qualcomm devfreq).
+        // cur_state=0 = no cooling = max GPU freq; max_state = max cooling = min freq.
+        'gpu: for search_type in &["thermal-devfreq-0"] {
+            if let Ok(entries) = fs::read_dir("/sys/class/cooling_device") {
+                for entry in entries.flatten() {
+                    let dev = entry.file_name().to_string_lossy().to_string();
+                    let type_path = format!("/sys/class/cooling_device/{}/type", dev);
+                    let dev_type = crate::sensor::sysfs::read_string(&type_path)
+                        .unwrap_or_default();
+                    if dev_type.trim() == *search_type {
+                        let cur_path = format!("/sys/class/cooling_device/{}/cur_state", dev);
+                        let max_path = format!("/sys/class/cooling_device/{}/max_state", dev);
+                        let max_val = crate::sensor::sysfs::read_int(&max_path).max(1);
+                        let cur_val = crate::sensor::sysfs::read_int(&cur_path).max(0);
+                        self.channels.push(CoolingChannel {
+                            name: "gpu".into(),
+                            path: cur_path,
+                            action_type: ActionType::None,
+                            group: ChannelGroup::Thermal,
+                            value: cur_val,
+                            min_val: 0,
+                            max_val,
+                            pid: None,
+                            pid_state: SicState::default(),
+                            sensor_name: None,
+                        });
+                        log_info!("AI-native: GPU channel {} ({}) max_state={}", dev, search_type, max_val);
+                        break 'gpu;
+                    }
+                }
             }
         }
 
@@ -819,6 +903,12 @@ impl NativeController {
         match ch.name.as_str() {
             "balance_mode" => (action as i32 * 7 / 9).min(7),
             "boost" => 1, // always on — balance_mode handles cooling
+            "gpu" => {
+                // cooling device: cur_state=0 = max GPU (no throttle), max_state = min GPU.
+                // action 9 (max perf) → cur_state=0. action 0 (max cool) → max_state.
+                let inv = 9u8.saturating_sub(action) as i32;
+                (inv * ch.max_val / 9).clamp(0, ch.max_val)
+            }
             _ => {
                 if action > 9 {
                     return ch.value;
