@@ -30,20 +30,21 @@ mi_thermald
 
 ## Operation Modes
 
-Two mutually exclusive modes, selected by the Android property `ro.vendor.mi_thermal_ai`:
+AI-native mode is the default. `ro.vendor.mi_thermal_ai` is optional and can override it:
 
-### 1. Traditional + AI mode (`false` / absent, or `engine`)
+### 1. Traditional + AI mode (`false` / `0`, or `engine`)
 - Loads Xiaomi's OEM thermal config files (AES-CBC encrypted) from the scenario selected by the `sconfig` sysfs node
 - Evaluates threshold-based instances per sensor (Monitor/SS/SIC/Simulated algorithms, `algorithm.rs`)
 - If `ro.vendor.mi_thermal_ai=engine`, an `AIEngine` (single Q-table) can override the traditional thermal level per-instance
 - Actions applied: cpufreq scaling_max, BCL current, FCC, hotplug, etc.
 
-### 2. Pure AI-native mode (`true` / `1`)
+### 2. Pure AI-native mode (property absent, `true` / `1`)
 - Bypasses all OEM config files entirely
 - Self-discovers thermal zones and writable cooling channels via sysfs at startup
 - `NativeController` groups channels into four independent control domains — `Compute`, `Thermal`, `Charging`, `Display` — each with its **own** Q-table per scenario (scenario = device mode reported by the `sconfig` sysfs node)
 - Directly writes CPU frequency targets, `balance_mode`/`boost`, backlight, and battery charge current
-- Dedicated 50ms CPU-frequency writer thread and 200ms charge-current writer thread for low-latency, lock-free updates (via shared atomics), independent of the 1s decision tick
+- Writes discovered CPU policies at the 1s decision tick; a separate 200ms charge-current writer handles FCC
+- Falls back to OEM thermal config if no writable cooling channels are discovered
 
 ## AI Module: Deep Dive
 
@@ -285,7 +286,7 @@ want debug-level tracing without changing `-l`.
 The daemon runs as a background service on Android. It uses:
 - `timerfd` / `epoll` for 1-second decision tick intervals
 - `inotify` to watch for config file changes and reload (ignored in AI-native mode)
-- Background threads for sensor polling (1s), CPU freq writing (50ms), FCC/charge-current writing (200ms), and delayed BCL init (5s after boot)
+- Background threads for sensor polling (1s), FCC/charge-current writing (200ms), and delayed BCL init (5s after boot)
 
 ### AI Data Persistence
 
@@ -305,6 +306,6 @@ OEM thermal configs live in `/data/vendor/thermal/config/` (or `/vendor/etc/`, `
 | `/data/vendor/thermal/last_thermal.dump` | Last state dump (shutdown) |
 | `/data/vendor/thermal/thermald_decrypt/` | Decrypted config dump |
 | `/data/vendor/thermal/ai_data/` | AI Q-table checkpoints + experience logs |
-| `/sys/devices/system/cpu/cpufreq/policy{0,3,7}/scaling_max_freq` | CPU freq targets |
+| `/sys/devices/system/cpu/cpufreq/policy*/scaling_max_freq` | Discovered CPU frequency targets |
 | `/sys/class/power_supply/battery/constant_charge_current` | Charge current target |
 | `/sys/class/thermal/thermal_message/sconfig` | Thermal profile ID (instant workload detection + scenario selection) |

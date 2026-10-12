@@ -123,9 +123,6 @@ pub fn is_debug_enabled() -> bool {
 static G_TERM: AtomicBool = AtomicBool::new(false);
 static G_USR1: AtomicBool = AtomicBool::new(false);
 pub(crate) static FCC_VALUE: AtomicI32 = AtomicI32::new(0);
-pub(crate) static CPU_FREQ0_TARGET: AtomicI32 = AtomicI32::new(0);
-pub(crate) static CPU_FREQ3_TARGET: AtomicI32 = AtomicI32::new(0);
-pub(crate) static CPU_FREQ7_TARGET: AtomicI32 = AtomicI32::new(0);
 
 extern "C" fn signal_term(_: libc::c_int) {
     G_TERM.store(true, Ordering::SeqCst);
@@ -270,7 +267,9 @@ impl Engine {
         // init oplus context -- frame_boost, sched_assist, memory, lahaina tuner
         self.oplus_ctx = Some(oplus::OplusContext::new());
 
-        let ai_prop = property_get_str("ro.vendor.mi_thermal_ai", "false");
+        // Native adaptive control is the default; an explicit property can
+        // still select the OEM config or hybrid engine for diagnostics.
+        let ai_prop = property_get_str("ro.vendor.mi_thermal_ai", "true");
         let ai_enabled = ai_prop == "true" || ai_prop == "1";
         let ai_engine_enabled = ai_prop == "engine";
 
@@ -282,23 +281,23 @@ impl Engine {
             let mut nc = ai::NativeController::new();
             nc.switch_scenario(self.current_scenario_idx);
             let n_channels = nc.channels.len();
-            self.native_controller = Some(nc);
-
-            log_info!("AI-native started ({} sensors, {} cooling channels)",
-                self.sensors.len(), n_channels);
-        } else {
+            if nc.is_enabled() {
+                self.native_controller = Some(nc);
+                log_info!("AI-native started ({} sensors, {} cooling channels)",
+                    self.sensors.len(), n_channels);
+            }
+            if self.native_controller.is_none() {
+                log_warn!("AI-native found no usable cooling channels; falling back to OEM config");
+                self.sensors.clear();
+            }
+        }
+        if self.native_controller.is_none() {
             if self.load_thermal_map_impl(&soc) != 0 {
                 log_err!("no thermal config — exiting");
                 return -1;
             }
             log_info!("thermald started ({} sensors, {} instances)",
                 self.sensors.len(), self.instances.len());
-
-            // Apply conservative CPU freq caps immediately at boot so the
-            // writer thread enforces them before the first thermal tick fires
-            // (~1s later). Without this, the CPU runs at hardware-max for
-            // the entire first second and temperatures spike to 90°C+.
-            Self::apply_boot_freq_caps();
 
             if ai_engine_enabled {
                 match ai::AIEngine::new() {
@@ -314,25 +313,6 @@ impl Engine {
         }
 
         0
-    }
-
-    /// Write conservative CPU frequency caps immediately at startup.
-    /// The `thread_cpu_freq_writer` loop reads these atomics every 50ms,
-    /// so the caps take effect well before the first thermal tick (~1s).
-    fn apply_boot_freq_caps() {
-        // 60% of each cluster's max — enough for a fast boot, cool enough
-        // to avoid the 90°C+ spike that occurs when the CPU runs at full
-        // speed for the entire first second before thermal control kicks in.
-        let caps = [
-            ("/sys/devices/system/cpu/cpufreq/policy0/scaling_max_freq", 1804800, &CPU_FREQ0_TARGET),
-            ("/sys/devices/system/cpu/cpufreq/policy4/scaling_max_freq", 2400000, &CPU_FREQ3_TARGET),
-            ("/sys/devices/system/cpu/cpufreq/policy7/scaling_max_freq", 2400000, &CPU_FREQ7_TARGET),
-        ];
-        for (path, val, atomic) in &caps {
-            atomic.store(*val, Ordering::Relaxed);
-            sysfs::write_int(path, *val);
-        }
-        log_info!("boot freq caps applied: policy0=1209 policy3=1681 policy7=1808 MHz");
     }
 
     fn setup_signals(&self) {
@@ -529,6 +509,9 @@ impl Engine {
     }
 
     fn tick_native(&mut self) -> i32 {
+        if let Some(ref mut ctx) = self.oplus_ctx {
+            ctx.tick();
+        }
         let new_idx = EngineDiscovery::read_sconfig_idx();
         if new_idx >= 0 {
             if let Some(ref mut nc) = self.native_controller {
@@ -617,27 +600,6 @@ fn thread_poll_sensors(engine: Arc<Mutex<Engine>>, shutdown: Arc<AtomicBool>) {
             }
         }
     });
-}
-
-fn thread_cpu_freq_writer() {
-    let paths = [
-        (0, "/sys/devices/system/cpu/cpufreq/policy0/scaling_max_freq", &CPU_FREQ0_TARGET),
-        (4, "/sys/devices/system/cpu/cpufreq/policy4/scaling_max_freq", &CPU_FREQ3_TARGET),
-        (7, "/sys/devices/system/cpu/cpufreq/policy7/scaling_max_freq", &CPU_FREQ7_TARGET),
-    ];
-    loop {
-        for &(_, path, target) in &paths {
-            // FIX BUG-004: Use Acquire ordering to ensure visibility of writes
-            let val = target.load(std::sync::atomic::Ordering::Acquire);
-            if val > 0 {
-                crate::sensor::sysfs::write_int(path, val);
-            }
-        }
-        thread::sleep(Duration::from_millis(50));
-        if G_TERM.load(std::sync::atomic::Ordering::Relaxed) {
-            break;
-        }
-    }
 }
 
 fn thread_fcc_writer() {
@@ -895,7 +857,6 @@ fn main() {
     let s = shutdown.clone();
     threads.push(thread::spawn(move || thread_oplus_app_watcher(e, s)));
 
-    threads.push(thread::spawn(|| thread_cpu_freq_writer()));
     threads.push(thread::spawn(|| thread_fcc_writer()));
 
     let s = shutdown.clone();

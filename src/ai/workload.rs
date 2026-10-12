@@ -32,15 +32,15 @@ pub struct WorkloadDetector {
     last_mode: WorkloadMode,
 
     // Hysteresis to prevent mode flapping
-    ticks_in_current_mode: u64,
+    candidate_mode: Option<WorkloadMode>,
+    candidate_ticks: u64,
     mode_switch_threshold: u64,
 
     // NEW: Thermal profile manager for instant detection
     profile_manager: ThermalProfileManager,
     sconfig_available: bool,
 
-    // Flag to bypass hysteresis after sconfig reset
-    force_mode_update: bool,
+    using_profile: bool,
 }
 
 impl WorkloadDetector {
@@ -56,11 +56,12 @@ impl WorkloadDetector {
         WorkloadDetector {
             high_load_ticks: 0,
             last_mode: WorkloadMode::Light,
-            ticks_in_current_mode: 0,
-            mode_switch_threshold: 10,  // 10 seconds before mode switch
+            candidate_mode: None,
+            candidate_ticks: 0,
+            mode_switch_threshold: 3,
             profile_manager: ThermalProfileManager::new(),
             sconfig_available,
-            force_mode_update: false,
+            using_profile: false,
         }
     }
 
@@ -78,6 +79,15 @@ impl WorkloadDetector {
         temp_variance: f32,
         screen_on: bool,
     ) -> WorkloadMode {
+        if !screen_on {
+            self.high_load_ticks = 0;
+            self.candidate_mode = None;
+            self.candidate_ticks = 0;
+            self.last_mode = WorkloadMode::Idle;
+            self.using_profile = false;
+            return WorkloadMode::Idle;
+        }
+
         // Priority 1: Check thermal profile from sconfig (instant, 100% accurate)
         if self.sconfig_available {
             if let Some(profile_id) = self.profile_manager.read_sconfig() {
@@ -86,10 +96,12 @@ impl WorkloadDetector {
                     if self.last_mode == WorkloadMode::Gaming || self.last_mode == WorkloadMode::Benchmark {
                         log_debug!("Thermal profile 0: resetting {:?} -> sensor detection", self.last_mode);
                     }
-                    // Reset counters to allow fresh sensor-based detection
-                    self.high_load_ticks = 0;
-                    self.ticks_in_current_mode = 0;
-                    self.force_mode_update = true;  // Bypass hysteresis on next update
+                    if self.using_profile {
+                        self.high_load_ticks = 0;
+                        self.candidate_mode = None;
+                        self.candidate_ticks = 0;
+                        self.using_profile = false;
+                    }
                     // Fall through to sensor detection
                 } else if let Some(mode) = self.profile_manager.profile_to_workload(profile_id) {
                     log_debug!("Workload from thermal profile {}: {:?}", profile_id, mode);
@@ -97,8 +109,10 @@ impl WorkloadDetector {
                     if mode != self.last_mode {
                         log_debug!("Workload mode changed (sconfig): {:?} -> {:?}", self.last_mode, mode);
                         self.last_mode = mode;
-                        self.ticks_in_current_mode = 0;
                     }
+                    self.candidate_mode = None;
+                    self.candidate_ticks = 0;
+                    self.using_profile = true;
                     return mode;
                 }
             }
@@ -156,30 +170,48 @@ impl WorkloadDetector {
 
     fn update_mode(&mut self, new_mode: WorkloadMode) -> WorkloadMode {
         if new_mode == self.last_mode {
-            self.ticks_in_current_mode += 1;
-            self.force_mode_update = false;  // Clear force flag
+            self.candidate_mode = None;
+            self.candidate_ticks = 0;
             new_mode
         } else {
-            // Force update if flag is set (after sconfig reset)
-            if self.force_mode_update {
-                self.ticks_in_current_mode = 0;
-                self.last_mode = new_mode;
-                self.force_mode_update = false;
-                log_debug!("Workload mode changed (forced): {:?}", new_mode);
-                return new_mode;
-            }
-
-            // Mode change detected, but wait for threshold (hysteresis)
-            if self.ticks_in_current_mode < self.mode_switch_threshold {
-                self.ticks_in_current_mode = 0;
-                self.last_mode  // Stay in old mode (hysteresis)
+            if self.candidate_mode == Some(new_mode) {
+                self.candidate_ticks += 1;
             } else {
-                // Confirmed mode change
-                self.ticks_in_current_mode = 0;
+                self.candidate_mode = Some(new_mode);
+                self.candidate_ticks = 1;
+            }
+            if self.candidate_ticks >= self.mode_switch_threshold {
+                self.candidate_mode = None;
+                self.candidate_ticks = 0;
                 self.last_mode = new_mode;
                 log_debug!("Workload mode changed: {:?}", new_mode);
                 new_mode
+            } else {
+                self.last_mode
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mode_changes_only_after_consecutive_candidate_ticks() {
+        let mut detector = WorkloadDetector::new();
+        detector.sconfig_available = false;
+        assert_eq!(detector.update_mode(WorkloadMode::Moderate), WorkloadMode::Light);
+        assert_eq!(detector.update_mode(WorkloadMode::Light), WorkloadMode::Light);
+        assert_eq!(detector.update_mode(WorkloadMode::Moderate), WorkloadMode::Light);
+        assert_eq!(detector.update_mode(WorkloadMode::Moderate), WorkloadMode::Light);
+        assert_eq!(detector.update_mode(WorkloadMode::Moderate), WorkloadMode::Moderate);
+    }
+
+    #[test]
+    fn screen_off_enters_idle_immediately() {
+        let mut detector = WorkloadDetector::new();
+        detector.sconfig_available = false;
+        assert_eq!(detector.detect_workload(0.8, 0.9, 0.9, false), WorkloadMode::Idle);
     }
 }

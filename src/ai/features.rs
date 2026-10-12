@@ -134,8 +134,11 @@ impl FeatureExtractor {
 
         // Extract device context
         let (battery_soc, is_charging, battery_current) = self.extract_battery_info(sensors);
-        let brightness = crate::sensor::sysfs::read_int("/sys/class/backlight/panel0-backlight/brightness");
-        let screen_on = if brightness > 0 { 1.0_f32 } else { 0.0_f32 };
+        let brightness = crate::sensor::sysfs::read_int_checked("/sys/class/backlight/panel0-backlight/brightness")
+            .or_else(|| crate::sensor::sysfs::read_int_checked("/sys/class/leds/lcd-backlight/brightness"));
+        // Unknown backlight node must not masquerade as screen-off and force
+        // the lowest performance ceiling on a different device.
+        let screen_on = if brightness.unwrap_or(1) > 0 { 1.0_f32 } else { 0.0_f32 };
         let time_of_day = self.get_time_of_day();
 
         // Compute headroom

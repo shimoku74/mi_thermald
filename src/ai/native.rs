@@ -56,6 +56,18 @@ fn action_for_battery_temp(workload_mode: WorkloadMode, batt_temp_c: f32) -> u8 
         .map_or(0, |&(_, action)| action)
 }
 
+fn interactive_compute_floor(mode: WorkloadMode, screen_on: bool, cpu_temp_normalized: f32) -> Option<u8> {
+    if !screen_on || cpu_temp_normalized >= 0.75 {
+        return None;
+    }
+    Some(match mode {
+        WorkloadMode::Idle => 3,
+        WorkloadMode::Light => 6,
+        WorkloadMode::Moderate => 7,
+        WorkloadMode::Gaming | WorkloadMode::PerfGaming | WorkloadMode::Benchmark => 8,
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ChannelGroup {
     Compute,
@@ -368,6 +380,15 @@ impl NativeController {
                 } else if !in_post_boot && group == ChannelGroup::Compute {
                     if is_heavy_load && final_action < 9 {
                         final_action = 9;
+                    } else if safe {
+                        // An untrained Q-table explores all actions, including
+                        // 30% CPU caps. Keep interactive use responsive while
+                        // the model learns; thermal and battery caps still apply.
+                        if let Some(floor) = interactive_compute_floor(
+                            workload_mode, state.screen_on > 0.5, state.t_cpu_max,
+                        ) {
+                            final_action = final_action.max(floor);
+                        }
                     }
                 }
 
@@ -555,11 +576,6 @@ impl NativeController {
         // CPU cluster discovery: read all policy* dirs, sort by max_freq ascending
         // → slot 0 = little, 1 = mid, 2 = prime. works on any SoC (not just 888/7325).
         {
-            let target_vars: [&'static std::sync::atomic::AtomicI32; 3] = [
-                &crate::CPU_FREQ0_TARGET,
-                &crate::CPU_FREQ3_TARGET,
-                &crate::CPU_FREQ7_TARGET,
-            ];
             let mut cpu_policies: Vec<(u32, i32)> = Vec::new();
             if let Ok(entries) = fs::read_dir("/sys/devices/system/cpu/cpufreq") {
                 for entry in entries.flatten() {
@@ -584,7 +600,6 @@ impl NativeController {
                 if std::path::Path::new(&path).exists() {
                     let cur = crate::sensor::sysfs::read_int(&path).max(0);
                     let cur = if cur > 0 { cur } else { hw_max };
-                    target_vars[slot].store(cur, std::sync::atomic::Ordering::Release);
                     self.channels.push(CoolingChannel {
                         name: format!("cpu_freq{}", policy),
                         path,
@@ -727,9 +742,6 @@ impl NativeController {
             }
             if ch.name.starts_with("cpu_freq") {
                 let value = Self::action_to_channel_value(action, ch);
-                if let Some(t) = Self::cpu_freq_target_var(&ch.name) {
-                    t.store(value, std::sync::atomic::Ordering::Release);
-                }
                 if crate::sensor::sysfs::write_int(&ch.path, value) {
                     ch.value = value;
                 }
@@ -795,15 +807,6 @@ impl NativeController {
         output = output.clamp(min_o, max_o);
 
         output as i32
-    }
-
-    fn cpu_freq_target_var(name: &str) -> Option<&'static std::sync::atomic::AtomicI32> {
-        match name {
-            "cpu_freq0" => Some(&crate::CPU_FREQ0_TARGET),
-            "cpu_freq3" => Some(&crate::CPU_FREQ3_TARGET),
-            "cpu_freq7" => Some(&crate::CPU_FREQ7_TARGET),
-            _ => None,
-        }
     }
 
     fn apply_temp_based_charge(&mut self) {
@@ -968,5 +971,18 @@ impl NativeController {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interactive_floor_preserves_thermal_headroom_rule() {
+        assert_eq!(interactive_compute_floor(WorkloadMode::Light, true, 0.5), Some(6));
+        assert_eq!(interactive_compute_floor(WorkloadMode::Moderate, true, 0.5), Some(7));
+        assert_eq!(interactive_compute_floor(WorkloadMode::Light, false, 0.5), None);
+        assert_eq!(interactive_compute_floor(WorkloadMode::Light, true, 0.75), None);
     }
 }
