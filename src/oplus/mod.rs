@@ -153,11 +153,14 @@ impl OplusContext {
     }
 
     /// Periodic tick from Engine tick loop
-    /// NOTE: Does NOT access disk or poll files! Uses in-memory state.
+    /// Keeps hot-path work in memory; hardware maintenance is rate limited.
     pub fn tick(&mut self) {
         // No-op for per-app config to eliminate filesystem I/O
         self.per_app.poll();
         self.update_bouncing_for_screen();
+        if self.is_lahaina {
+            self.tuner.maintenance_tick();
+        }
         // re-arm wifi low latency on every wlan0 reconnect
         self.wifi_latency.tick();
     }

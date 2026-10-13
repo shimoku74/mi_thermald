@@ -71,6 +71,7 @@ pub enum LahainaTuningMode {
 pub struct LahainaTuner {
     mode: LahainaTuningMode,
     is_available: bool,
+    maintenance_ticks: u32,
     /// cpufreq policies confirmed to exist on this kernel. Writing a ceiling
     /// into a policy that was never validated is how you clock an A55 cluster
     /// at 2.4 GHz and hard-lock the SoC, so every write is gated on these.
@@ -111,6 +112,7 @@ impl LahainaTuner {
         let tuner = LahainaTuner {
             mode: LahainaTuningMode::Normal,
             is_available: avail,
+            maintenance_ticks: 0,
             has_policy0,
             has_policy4,
             has_policy7,
@@ -128,18 +130,53 @@ impl LahainaTuner {
     /// silver needs the most help -- UI threads live there and the default
     /// 1.3 GHz boost is borderline for heavy blur compositing.
     fn init_touch_boost(&self) {
-        // silver (cpu0): bump to 1574400 kHz, keep 150ms window
-        // gold/prime (cpu4/cpu7): leave at 0 -- they're already responsive via
-        // schedutil and we don't want wasted energy on every tap
+        // Prefer the native Oplus node where the kernel provides it. On other
+        // Lahaina kernels, fall back to Qualcomm cpu_boost below.
         const TB_SILVER_FREQ: &str =
             "/sys/devices/system/cpu/cpu0/touch_boost/touch_boost_freq";
         const TB_SILVER_MS: &str =
             "/sys/devices/system/cpu/cpu0/touch_boost/touch_boost_ms";
 
         if Path::new(TB_SILVER_FREQ).exists() {
-            write_node_str(TB_SILVER_FREQ, "1574400\n");
-            write_node_str(TB_SILVER_MS, "150\n");
-            log_info!("oplus/lahaina: touch_boost silver -> 1574400 kHz / 150ms");
+            if !node_value_equals(TB_SILVER_FREQ, "1574400")
+                || !node_value_equals(TB_SILVER_MS, "120")
+            {
+                write_node_str(TB_SILVER_FREQ, "1574400\n");
+                write_node_str(TB_SILVER_MS, "120\n");
+                log_info!("oplus/lahaina: touch_boost silver -> 1574400 kHz / 120ms");
+            }
+            return;
+        }
+
+        // Qualcomm cpu_boost is used by the OKX SM8350 kernel. The old
+        // /proc/sys/walt/input_boost path is absent there, so writes from the
+        // vendor rc were silently ignored and the device stayed on the weak
+        // kernel default (Silver only at 1.324 GHz). A short Gold boost is
+        // enough for SystemUI blur and remains bounded by thermal cpufreq caps.
+        const CPU_BOOST_FREQ: &str =
+            "/sys/devices/system/cpu/cpu_boost/input_boost_freq";
+        const CPU_BOOST_MS: &str =
+            "/sys/devices/system/cpu/cpu_boost/input_boost_ms";
+
+        if Path::new(CPU_BOOST_FREQ).exists() {
+            const EXPECTED_FREQ: &str =
+                "0:1574400 1:0 2:0 3:0 4:1804800 5:0 6:0 7:0";
+            if !node_value_equals(CPU_BOOST_FREQ, EXPECTED_FREQ)
+                || !node_value_equals(CPU_BOOST_MS, "120")
+            {
+                write_node_str(CPU_BOOST_FREQ, &format!("{}\n", EXPECTED_FREQ));
+                write_node_str(CPU_BOOST_MS, "120\n");
+                log_info!("oplus/lahaina: cpu_boost -> silver 1574400, gold 1804800 / 120ms");
+            }
+        }
+    }
+
+    /// Late vendor power services may restore their stock boost after this
+    /// daemon starts. Recheck infrequently and write only when it drifted.
+    pub fn maintenance_tick(&mut self) {
+        self.maintenance_ticks = self.maintenance_ticks.wrapping_add(1);
+        if self.maintenance_ticks % 30 == 0 {
+            self.init_touch_boost();
         }
     }
 
@@ -326,6 +363,12 @@ fn write_node_str(path: &str, val: &str) -> bool {
         Ok(mut f) => f.write_all(val.as_bytes()).is_ok(),
         Err(_) => false,
     }
+}
+
+fn node_value_equals(path: &str, expected: &str) -> bool {
+    std::fs::read_to_string(path)
+        .map(|value| value.trim() == expected.trim())
+        .unwrap_or(false)
 }
 
 /// Helper to write integer string to proc/sysfs node

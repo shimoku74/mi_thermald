@@ -54,9 +54,15 @@ pub struct WifiLatencyMode {
 
 impl WifiLatencyMode {
     pub fn new() -> Self {
-        let available = Path::new(WLAN_OPERSTATE).exists();
-        if available {
-            log_info!("oplus/wifi_latency: wlan0 operstate node found, low-latency enforcer active");
+        let node_present = Path::new(WLAN_OPERSTATE).exists();
+        // mi_thermald is a confined vendor domain. Reading sysfs_net and
+        // executing the system `cmd` client are both rejected by the stock
+        // policy; in permissive builds each one-second poll also creates audit
+        // work on the UI path. Keep this optional helper dormant instead of
+        // relying on permissive SELinux or adding broad cross-partition access.
+        let available = false;
+        if node_present {
+            log_info!("oplus/wifi_latency: disabled in confined thermal domain");
         } else {
             log_info!("oplus/wifi_latency: wlan0 operstate not found, skipping");
         }

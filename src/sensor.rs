@@ -2,7 +2,7 @@ use crate::types::*;
 use std::sync::atomic::Ordering;
 
 pub mod sysfs {
-    use std::fs::File;
+    use std::fs::{File, OpenOptions};
     use std::io::{Read, Write};
 
     pub fn read_int(path: &str) -> i32 {
@@ -41,7 +41,9 @@ pub mod sysfs {
     }
 
     pub fn write_int(path: &str, value: i32) -> bool {
-        let mut f = match File::create(path) {
+        // Sysfs/procfs attributes already exist. O_CREAT generates SELinux
+        // create denials on these virtual files and adds audit work per tick.
+        let mut f = match OpenOptions::new().write(true).open(path) {
             Ok(f) => f,
             Err(_) => return false,
         };

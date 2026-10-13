@@ -686,20 +686,6 @@ const FG_NODES: [&str; 3] = [
     "/dev/sys_thermal_top_pkg",
 ];
 
-// Expensive fallback. `dumpsys activity top` is a binder round-trip into
-// system_server that dumps the whole activity/window tree; it typically burns
-// tens to hundreds of milliseconds of CPU. Forking it on a fast timer is a
-// direct cause of the frame drops and input lag we are trying to remove, so it
-// is throttled hard and backed off when it yields nothing.
-static FG_DUMPSYS_LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static FG_DUMPSYS_BACKOFF: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-fn now_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
 
 /// Read the foreground package from cheap procfs/sysfs nodes only.
 /// Returns None when no cheap source is available on this kernel.
@@ -715,85 +701,11 @@ fn read_foreground_pkg_fast() -> Option<String> {
     None
 }
 
-/// Expensive foreground lookup via dumpsys. Rate-limited by the caller.
-fn read_foreground_pkg_dumpsys() -> Option<String> {
-    for exe in ["/system/bin/dumpsys", "dumpsys"] {
-        let output = match std::process::Command::new(exe)
-            .args(&["activity", "top"])
-            .output()
-        {
-            Ok(o) => o,
-            Err(_) => continue,
-        };
-        let text = match std::str::from_utf8(&output.stdout) {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
-
-        // Primary form: "  ACTIVITY com.pkg/.SomeActivity 1234 pid=5678"
-        for line in text.lines() {
-            if let Some(idx) = line.find("ACTIVITY ") {
-                let rest = &line[idx + 9..];
-                if let Some(slash_idx) = rest.find('/') {
-                    let pkg = rest[..slash_idx].trim();
-                    if !pkg.is_empty() && pkg != "none" {
-                        return Some(pkg.to_string());
-                    }
-                }
-            }
-        }
-
-        // Secondary form: "  mResumedActivity: ActivityRecord{... com.pkg/.Act ...}"
-        for line in text.lines() {
-            if let Some(idx) = line.find("mResumedActivity") {
-                let rest = &line[idx..];
-                if let Some(p0) = rest.find(char::is_alphabetic) {
-                    let tail = &rest[p0..];
-                    if let Some(slash_idx) = tail.find('/') {
-                        let pkg = tail[..slash_idx].trim();
-                        if !pkg.is_empty() && pkg.contains('.') {
-                            return Some(pkg.to_string());
-                        }
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Foreground package, cheap path first, throttled dumpsys fallback.
-/// Returns an empty String when the value could not be determined this tick --
-/// callers MUST treat that as "no new information", not as "no game".
+/// Returns an empty String when no permitted foreground source is available.
+/// In that case the current game profile is retained until another source
+/// reports a package. Forking dumpsys here caused repeated binder/audit work.
 fn read_foreground_pkg() -> String {
-    if let Some(pkg) = read_foreground_pkg_fast() {
-        // A cheap source answered; any accumulated backoff is irrelevant.
-        FG_DUMPSYS_BACKOFF.store(0, std::sync::atomic::Ordering::Relaxed);
-        return pkg;
-    }
-
-    use std::sync::atomic::Ordering;
-    let now = now_millis();
-    let last = FG_DUMPSYS_LAST.load(Ordering::Relaxed);
-    let backoff = FG_DUMPSYS_BACKOFF.load(Ordering::Relaxed);
-    // 2 s base, growing to 10 s while dumpsys keeps producing nothing usable.
-    let min_interval = 2000u64 + backoff;
-    if last != 0 && now.saturating_sub(last) < min_interval {
-        return String::new();
-    }
-    FG_DUMPSYS_LAST.store(now, Ordering::Relaxed);
-
-    match read_foreground_pkg_dumpsys() {
-        Some(pkg) => {
-            FG_DUMPSYS_BACKOFF.store(0, Ordering::Relaxed);
-            pkg
-        }
-        None => {
-            FG_DUMPSYS_BACKOFF.store((backoff * 2).min(8000), Ordering::Relaxed);
-            log_warn!("oplus/watcher: dumpsys returned no foreground package");
-            String::new()
-        }
-    }
+    read_foreground_pkg_fast().unwrap_or_default()
 }
 
 // background thread: poll foreground app and drive oplus game mode transitions
@@ -810,8 +722,8 @@ fn thread_oplus_app_watcher(
 
         let pkg = read_foreground_pkg();
 
-        // Empty means "lookup did not resolve this tick" (throttled dumpsys or
-        // transient failure). It does NOT mean the game closed -- acting on it
+        // Empty means lookup did not resolve this tick. It does NOT mean the
+        // game closed -- acting on it
         // would flap between on_game_enter/on_game_exit and thrash the kernel
         // nodes on every miss.
         if pkg.is_empty() || pkg == last_pkg { continue; }
