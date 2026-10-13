@@ -34,10 +34,13 @@ type TempLadder = &'static [(f32, u8)];
 
 // Benchmark allows the highest temps (up to 46°C).
 const LADDER_BENCHMARK: TempLadder = &[(41.5, 9), (43.5, 8), (46.0, 6), (f32::MAX, 5)];
-// PerfGaming: high temps allowed (up to 44°C).
-const LADDER_PERFGAMING: TempLadder = &[(38.0, 9), (40.0, 8), (42.0, 7), (44.0, 6), (f32::MAX, 5)];
-// Gaming: high temps allowed (up to 42°C).
-const LADDER_GAMING: TempLadder = &[(36.0, 9), (38.0, 8), (40.0, 7), (42.0, 6), (f32::MAX, 5)];
+// PerfGaming keeps short peak bursts but starts reducing sustained power before
+// the battery reaches uncomfortable skin temperatures.
+const LADDER_PERFGAMING: TempLadder =
+    &[(36.0, 8), (38.0, 7), (40.0, 6), (42.0, 4), (43.0, 3), (f32::MAX, 2)];
+// Gaming targets sustained frame pacing rather than permanent maximum clocks.
+const LADDER_GAMING: TempLadder =
+    &[(34.5, 8), (36.5, 7), (38.5, 6), (40.5, 4), (42.0, 3), (f32::MAX, 2)];
 const LADDER_MODERATE: TempLadder =
     &[(36.0, 9), (38.0, 8), (40.0, 7), (41.0, 6), (42.0, 4), (45.0, 3), (f32::MAX, 2)];
 const LADDER_DEFAULT: TempLadder =
@@ -64,7 +67,8 @@ fn interactive_compute_floor(mode: WorkloadMode, screen_on: bool, cpu_temp_norma
         WorkloadMode::Idle => 3,
         WorkloadMode::Light => 6,
         WorkloadMode::Moderate => 7,
-        WorkloadMode::Gaming | WorkloadMode::PerfGaming | WorkloadMode::Benchmark => 8,
+        WorkloadMode::Gaming | WorkloadMode::PerfGaming => 7,
+        WorkloadMode::Benchmark => 8,
     })
 }
 
@@ -378,8 +382,14 @@ impl NativeController {
                 if in_boot_phase {
                     final_action = final_action.min(BOOT_MAX_ACTION);
                 } else if !in_post_boot && group == ChannelGroup::Compute {
-                    if is_heavy_load && final_action < 9 {
-                        final_action = 9;
+                    if is_heavy_load {
+                        let sustained_floor = match workload_mode {
+                            crate::ai::WorkloadMode::Benchmark => 9,
+                            crate::ai::WorkloadMode::Gaming
+                            | crate::ai::WorkloadMode::PerfGaming => 8,
+                            _ => 8,
+                        };
+                        final_action = final_action.max(sustained_floor);
                     } else if safe {
                         // An untrained Q-table explores all actions, including
                         // 30% CPU caps. Keep interactive use responsive while
@@ -460,6 +470,8 @@ impl NativeController {
                     ChannelGroup::Thermal => 7,
                     _ => 9,
                 },
+                (false, crate::ai::WorkloadMode::Gaming)
+                | (false, crate::ai::WorkloadMode::PerfGaming) => 8,
                 _ => 9,
             };
             if *act > ceil {
@@ -736,8 +748,9 @@ impl NativeController {
             }
             if ch.name == "boost" {
                 let boost_val = Self::action_to_channel_value(action, ch);
-                crate::sensor::sysfs::write_int(&ch.path, boost_val);
-                ch.value = boost_val;
+                if boost_val != ch.value && crate::sensor::sysfs::write_int(&ch.path, boost_val) {
+                    ch.value = boost_val;
+                }
                 continue;
             }
             if ch.name.starts_with("cpu_freq") {
@@ -905,7 +918,10 @@ impl NativeController {
     fn action_to_channel_value(action: u8, ch: &CoolingChannel) -> i32 {
         match ch.name.as_str() {
             "balance_mode" => (action as i32 * 7 / 9).min(7),
-            "boost" => 1, // always on — balance_mode handles cooling
+            // Global thermal boost is expensive when held continuously. Keep
+            // it only for cool, high-performance actions; input/frame boost
+            // still handles short UI and render bursts independently.
+            "boost" => i32::from(action >= 8),
             "gpu" => {
                 // cooling device: cur_state=0 = max GPU (no throttle), max_state = min GPU.
                 // action 9 (max perf) → cur_state=0. action 0 (max cool) → max_state.
@@ -982,7 +998,15 @@ mod tests {
     fn interactive_floor_preserves_thermal_headroom_rule() {
         assert_eq!(interactive_compute_floor(WorkloadMode::Light, true, 0.5), Some(6));
         assert_eq!(interactive_compute_floor(WorkloadMode::Moderate, true, 0.5), Some(7));
+        assert_eq!(interactive_compute_floor(WorkloadMode::Gaming, true, 0.5), Some(7));
         assert_eq!(interactive_compute_floor(WorkloadMode::Light, false, 0.5), None);
         assert_eq!(interactive_compute_floor(WorkloadMode::Light, true, 0.75), None);
+    }
+
+    #[test]
+    fn gaming_temperature_ladder_reduces_sustained_power() {
+        assert_eq!(action_for_battery_temp(WorkloadMode::Gaming, 34.0), 8);
+        assert_eq!(action_for_battery_temp(WorkloadMode::Gaming, 39.0), 4);
+        assert_eq!(action_for_battery_temp(WorkloadMode::Gaming, 42.5), 2);
     }
 }

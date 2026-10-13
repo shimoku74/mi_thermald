@@ -211,9 +211,9 @@ impl LahainaTuner {
     /// Apply gaming performance profile:
     /// - Uncap Silver, Gold, and Prime to max silicon clocks
     /// - Instant schedutil up-ramp (0 us delay)
-    /// - 20ms hold down hysteresis to prevent micro-dips during GPU draw calls
-    /// - Aggressive WALT upmigration (65/55) so tasks reach big cores immediately
-    /// - Enable WALT sched_boost for frame pipeline
+    /// - 10ms hold down hysteresis for one 120Hz frame budget
+    /// - Balanced WALT upmigration (70/55)
+    /// - Frame groups provide targeted boost without global sched_boost
     pub fn apply_game(&mut self) {
         if self.mode == LahainaTuningMode::Game {
             return;
@@ -233,17 +233,17 @@ impl LahainaTuner {
         write_node_int(SUTIL_UP_RATE_GOLD, 0);
         write_node_int(SUTIL_UP_RATE_PRIME, 0);
 
-        // 20ms hold-down: keeps clocks up across a full frame budget so we don't
-        // ramp down between gpu submit and the next cpu frame start
-        write_node_int(SUTIL_DW_RATE_SILVER, 20_000);
-        write_node_int(SUTIL_DW_RATE_GOLD, 20_000);
-        write_node_int(SUTIL_DW_RATE_PRIME, 20_000);
+        // 10ms covers a 120Hz frame without holding all clusters high across
+        // multiple frames under sustained load.
+        write_node_int(SUTIL_DW_RATE_SILVER, 10_000);
+        write_node_int(SUTIL_DW_RATE_GOLD, 10_000);
+        write_node_int(SUTIL_DW_RATE_PRIME, 10_000);
 
-        // lower upmigration threshold: render threads move to big cores faster --
-        // 65/55 is the sweet spot for gaming; default 80/60 is too slow for 120hz
-        write_node_int(WALT_UPMIGRATE, 65);
+        // Keep render threads responsive without migrating every medium task to
+        // the hot cluster. Frame groups still prioritize the actual game work.
+        write_node_int(WALT_UPMIGRATE, 70);
         write_node_int(WALT_DOWNMIGRATE, 55);
-        write_node_int(WALT_SCHED_BOOST, 1); // boost all tasks' util signal slightly
+        write_node_int(WALT_SCHED_BOOST, 0); // frame groups already boost render tasks
         write_node_int(WALT_CPU_MULTI_THREAD, 1); // allow game engine worker spread
         write_node_int("/proc/sys/kernel/sched_util_clamp_min", 0);
     }

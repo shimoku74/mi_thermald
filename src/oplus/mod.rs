@@ -197,10 +197,9 @@ impl OplusContext {
         let fps = if wants_120hz { 120 } else { 60 };
 
         log_info!(
-            "oplus: entering GAME mode for package '{}' (target_fps={}, skip_cpu_cap={})",
+            "oplus: entering GAME mode for package '{}' (target_fps={})",
             pkg,
-            fps,
-            self.per_app.skip_cpu_cap(pkg)
+            fps
         );
 
         self.current_pkg = pkg.to_string();
@@ -296,13 +295,6 @@ impl OplusContext {
         log_info!("oplus: thermal level transition -> {}", level);
 
         if level > 0 {
-            // nocap packages (e.g. genshin) specifically opted out of thermal caps --
-            // honor that even when the SoC is hot; they manage their own workload
-            if self.frame_boost.is_in_game() && self.per_app.skip_cpu_cap(&self.current_pkg) {
-                log_info!("oplus: package '{}' has nocap hint; maintaining game clocks", self.current_pkg);
-                return;
-            }
-
             if self.is_lahaina {
                 self.tuner.apply_thermal_level(level);
             }

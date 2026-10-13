@@ -8,14 +8,14 @@ const MAX_CPU_TEMP_MC: i32 = 85000;
 // Context-dependent battery thresholds
 const BATTERY_TEMP_IDLE_MC: i32 = 38000;       // 38°C when idle/light
 const BATTERY_TEMP_MODERATE_MC: i32 = 40000;   // 40°C moderate load
-const BATTERY_TEMP_PERFGAMING_MC: i32 = 45000; // 45°C gaming
-const BATTERY_TEMP_GAMING_MC: i32 = 44000;     // 44°C gaming
-const BATTERY_TEMP_BENCHMARK_MC: i32 = 48000;  // 48°C benchmark/stress test
+const BATTERY_TEMP_PERFGAMING_MC: i32 = 43000; // 43°C performance gaming
+const BATTERY_TEMP_GAMING_MC: i32 = 42000;     // 42°C gaming
+const BATTERY_TEMP_BENCHMARK_MC: i32 = 47000;  // 47°C benchmark/stress test
 
 const BATTERY_WARN_IDLE_MC: i32 = 35000;       // 35°C warning (idle)
 const BATTERY_WARN_MODERATE_MC: i32 = 37000;   // 37°C warning (moderate)
-const BATTERY_WARN_PERFGAMING_MC: i32 = 44000; // 44°C warning (perfgaming)
-const BATTERY_WARN_GAMING_MC: i32 = 42000;     // 42°C warning (gaming)
+const BATTERY_WARN_PERFGAMING_MC: i32 = 40000; // 40°C warning (perfgaming)
+const BATTERY_WARN_GAMING_MC: i32 = 39000;     // 39°C warning (gaming)
 const BATTERY_WARN_BENCHMARK_MC: i32 = 45000;  // 45°C warning (benchmark)
 
 const MAX_VIOLATIONS: u32 = 10;

@@ -9,6 +9,6 @@ cargo build --release --target aarch64-linux-android --offline
 install -m 0755 target/aarch64-linux-android/release/mi_thermald prebuilt/mi_thermald
 ```
 
-SHA-256: `c77adc32f273266f68e49ef8bed2fdd7f461ddb174e9d9c858e51c695400bf7b`
+SHA-256: `9b4a8eb535f65a9b00c8fd7227ab970eecfb044e00a94d80bcf32d77709d7468`
 
 Install as the device's thermal service executable with mode 0755 and the existing service label. Do not run two thermal daemons against the same cooling nodes.

@@ -27,10 +27,9 @@ const DISABLE_CPUFREQ_LIMIT: &str = "/proc/game_opt/disable_cpufreq_limit";
 
 // SM8350 (lahaina) gaming cpu min floors in kHz
 // silver (0-3): no floor -- cpufreq_bouncing already handles idle suppression
-// gold (4-6):   1574400 -- stops game worker threads dipping mid-burst
-// prime (7):    1497600 -- keeps render thread above the "sluggish" OPP
-// note: this is a FLOOR not a cap; max freq stays unconstrained per user request
-const GAME_FLOORS: &str = "0:0 1:0 2:0 3:0 4:1574400 5:1574400 6:1574400 7:1497600";
+// Keep only a modest floor. Frame/input boost supplies short bursts while the
+// lower sustained floor prevents Gold and Prime from heating the chassis.
+const GAME_FLOORS: &str = "0:0 1:0 2:0 3:0 4:1228800 5:1228800 6:1228800 7:1056000";
 // all zeros = clear floors on exit
 const CLEAR_FLOORS: &str = "0:0 1:0 2:0 3:0 4:0 5:0 6:0 7:0";
 

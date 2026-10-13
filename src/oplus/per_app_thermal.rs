@@ -29,7 +29,7 @@ pub enum AppMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThermalHint {
     ForceRr,  // forcerr -> lock display to 120Hz, suppress panel throttling
-    NoCap,    // nocap   -> bypass cpu frequency caps during thermal rise
+    NoCap,    // legacy token; thermal safety caps are always enforced
     Light,    // light   -> only mild throttling allowed (level 1 max)
     Normal,   // normal  -> standard thermal throttling policy
 }
@@ -130,7 +130,7 @@ impl PerAppThermal {
         matches!(self.peek_app(pkg), Some(e) if e.hint == ThermalHint::ForceRr)
     }
 
-    /// Check if package requests skipping CPU frequency cap
+    /// Legacy parser query. Runtime thermal caps deliberately ignore this hint.
     pub fn skip_cpu_cap(&self, pkg: &str) -> bool {
         matches!(self.peek_app(pkg), Some(e) if e.hint == ThermalHint::NoCap)
     }
