@@ -216,6 +216,10 @@ impl OplusContext {
         // 4. Memory Manager: pause background hybridswapd aging loop to prevent frame drops
         self.memory.set_game_pressure();
 
+        // 4b. Midas: disable per-task time accounting -- not a lag root cause
+        //     but it's dead-weight bookkeeping overhead while gaming (no reader)
+        self.midas.set_cpu_accounting(false);
+
         // 5. Hardware Tuner: uncap all clusters and set 20ms schedutil hold down
         if self.is_lahaina {
             self.tuner.apply_game();
@@ -282,6 +286,9 @@ impl OplusContext {
 
         // 8. Memory Manager resume swapd
         self.memory.set_normal_pressure();
+
+        // 8b. Midas: resume cpu_accounting now that nobody's gaming
+        self.midas.set_cpu_accounting(true);
 
         // 9. Hardware Tuner restore balanced caps
         if self.is_lahaina {

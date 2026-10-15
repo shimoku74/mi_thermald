@@ -127,7 +127,10 @@ impl SchedAssist {
         self.set_sched_assist_enabled(true);
         self.set_frame_boost_enabled(true);
         self.set_frame_rate(60); // safe default; overridden on game enter
-        self.set_boost_task_threshold(102); // ~40% util before boosting kicks in
+        // was 102 (~40% util) -- user reports shade/blur stutter under default,
+        // 75 (~30%) fires kernel ux boost earlier on scroll kickoff which is
+        // exactly when shade pull + blur compositing starves silver cluster
+        self.set_boost_task_threshold(75);
         self.set_audio_perf(true); // keep audio rt latency path always armed
         self.set_binder_async_ux(true); // async binder inherits caller ux prio
     }
@@ -142,17 +145,60 @@ impl SchedAssist {
         write_node_int(SYSCTL_SA_ENABLED, val)
     }
 
-    /// Set current active scheduler scene bitmask
+    /// Set current active scheduler scene bitmask.
+    ///
+    /// NEW KERNEL DECODER (post sched_assist_main.c patch): writes are now
+    /// SET-or-CLEAR commands applied via cmpxchg, not whole-mask writes.
+    ///   value = bit | 0x80  -> SET that bit in the scene state
+    ///   value = bit         -> CLEAR that bit in the scene state
+    ///   value = 0           -> clear ALL
+    /// ColorOS sends 129/1/144/16/384/256 which maps to SET LAUNCH / CLEAR LAUNCH
+    /// / SET ANIM / CLEAR ANIM / SET GPU_COMP / CLEAR GPU_COMP respectively.
+    /// Writing a plain combined mask (what the old port did) would be interpreted
+    /// as CLEAR for every bit set in it — exactly backwards. So this function
+    /// now diffs old vs new and emits one write per changed bit.
     pub fn set_scene(&mut self, scene: u32) {
         if self.current_scene == scene {
-            return; // no change, skip the write
+            return; // no change, skip the writes
         }
+
+        // mass clear = one 0 write, kernel resets the full scene state
+        if scene == 0 {
+            if !write_node_int(NODE_SA_SCENE, 0) {
+                write_node_int(SYSCTL_SA_SCENE, 0);
+            }
+            self.current_scene = 0;
+            log_debug!("oplus/sched_assist: cleared all scenes");
+            return;
+        }
+
+        // bit-diff: what changed between old and new scene state
+        let to_set = scene & !self.current_scene; // bits newly on
+        let to_clear = self.current_scene & !scene; // bits newly off
+
+        // iterate bits 0..=9 (SA_LAUNCH .. SA_AUDIO span)
+        for bit in 0..=9u32 {
+            let mask = 1u32 << bit;
+            if to_set & mask != 0 {
+                // SET this bit: write (mask | SA_SCENE_OPT_SET)
+                let cmd = (mask | SA_SCENE_OPT_SET) as i32;
+                if !write_node_int(NODE_SA_SCENE, cmd) {
+                    write_node_int(SYSCTL_SA_SCENE, cmd);
+                }
+            } else if to_clear & mask != 0 {
+                // CLEAR this bit: write raw mask (no SET bit)
+                let cmd = mask as i32;
+                if !write_node_int(NODE_SA_SCENE, cmd) {
+                    write_node_int(SYSCTL_SA_SCENE, cmd);
+                }
+            }
+        }
+
         self.current_scene = scene;
-        // new procfs path preferred; sysctl fallback for older okx builds
-        if !write_node_int(NODE_SA_SCENE, scene as i32) {
-            write_node_int(SYSCTL_SA_SCENE, scene as i32);
-        }
-        log_debug!("oplus/sched_assist: active scene set to 0x{:03x}", scene);
+        log_debug!(
+            "oplus/sched_assist: scene diff set=0x{:x} clear=0x{:x} -> 0x{:03x}",
+            to_set, to_clear, scene
+        );
     }
 
     /// Add scene flags to current active scene
@@ -167,7 +213,7 @@ impl SchedAssist {
         self.set_scene(new_scene);
     }
 
-    /// Clear all active scenes back to baseline
+    /// Clear all active scenes back to baseline (sends single 0 → kernel resets whole state)
     pub fn clear_scene(&mut self) {
         self.set_scene(SA_SCENE_OPT_CLEAR);
         self.set_slide_boost(false);

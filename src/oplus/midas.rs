@@ -23,10 +23,19 @@
 //                  informational only, does not feed any decision here.
 
 use std::ffi::CString;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::Path;
 
 const MIDAS_DEV_PATH: &str = "/dev/midas_dev";
 const EM_CNT_MAX: usize = 100;
+
+// user patched midas with a cpu_accounting knob (defaults Y). flipping it off
+// disables record_task_times, the per-task runtime bookkeeping. measured max
+// spinlock contribution is 223us -- not a lag root cause -- but we still turn
+// it off during gaming because it's dead-weight overhead when nobody's reading
+// the stats, and A/B toggling via one knob is exactly what the patch is for.
+const MIDAS_CPU_ACCOUNTING: &str = "/sys/module/midas/parameters/cpu_accounting";
 
 // Standard Linux ioctl command encoding (asm-generic/ioctl.h): a plain
 // 32-bit unsigned value with dir in the top 2 bits. _IOC_READ (dir=2) sets
@@ -113,6 +122,20 @@ impl MidasController {
 
     pub fn is_available(&self) -> bool {
         self.available
+    }
+
+    /// Toggle midas record_task_times via the user-added cpu_accounting knob.
+    /// Pass false on game enter, true on game exit. no-op if the knob isn't
+    /// built into the kernel (older midas builds).
+    pub fn set_cpu_accounting(&self, enable: bool) {
+        if !Path::new(MIDAS_CPU_ACCOUNTING).exists() {
+            return;
+        }
+        let val = if enable { "Y\n" } else { "N\n" };
+        if let Ok(mut f) = OpenOptions::new().write(true).open(MIDAS_CPU_ACCOUNTING) {
+            let _ = f.write_all(val.as_bytes());
+            log_debug!("oplus/midas: cpu_accounting -> {}", if enable { "Y" } else { "N" });
+        }
     }
 }
 

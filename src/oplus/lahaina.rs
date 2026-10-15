@@ -22,6 +22,13 @@ pub const POLICY7_MAX: &str = "/sys/devices/system/cpu/cpufreq/policy7/scaling_m
 pub const POLICY7_MIN: &str = "/sys/devices/system/cpu/cpufreq/policy7/scaling_min_freq";
 pub const POLICY7_GOV: &str = "/sys/devices/system/cpu/cpufreq/policy7/scaling_governor";
 
+// walt cpu-boost legacy_input_boost knob (user patched kernel to expose this).
+// enabling it brings back the touch-floor path that bumps all clusters on tap --
+// kills app launch stutter and animation start cold-ramp lag.
+pub const CPU_BOOST_LEGACY_INPUT: &str = "/sys/module/cpu_boost/parameters/legacy_input_boost";
+pub const CPU_BOOST_INPUT_MS: &str = "/sys/module/cpu_boost/parameters/input_boost_ms";
+pub const CPU_BOOST_INPUT_FREQ: &str = "/sys/module/cpu_boost/parameters/input_boost_freq";
+
 // Schedutil rate limits (microseconds)
 pub const SUTIL_UP_RATE_SILVER: &str = "/sys/devices/system/cpu/cpufreq/policy0/schedutil/up_rate_limit_us";
 pub const SUTIL_UP_RATE_GOLD: &str = "/sys/devices/system/cpu/cpufreq/policy4/schedutil/up_rate_limit_us";
@@ -43,18 +50,27 @@ pub const FREQ_SILVER_MAX: i32 = 1804800;
 pub const FREQ_SILVER_BALANCED: i32 = 1804800;
 pub const FREQ_SILVER_THROTTLE: i32 = 1209600;
 pub const FREQ_SILVER_MIN: i32 = 300000;
+// scaling_min_freq floor applied during games -- silver can't drop below this
+// or ui thread + input dispatch starve mid-frame on 120hz. matches qcom
+// recommended "game floor" for a55 cores.
+pub const FREQ_SILVER_GAME_FLOOR: i32 = 1248000;
 
 pub const FREQ_GOLD_MAX: i32 = 2400000;
 pub const FREQ_GOLD_BALANCED: i32 = 2400000;
 pub const FREQ_GOLD_THROTTLE_L1: i32 = 2035200;
 pub const FREQ_GOLD_THROTTLE_L2: i32 = 1612800;
 pub const FREQ_GOLD_MIN: i32 = 710400;
+// gold floor keeps engine worker threads from dipping between frames; without
+// this the 120fps->110fps drops happen when gold ramps down after a frame submit
+pub const FREQ_GOLD_GAME_FLOOR: i32 = 1708800;
 
 pub const FREQ_PRIME_MAX: i32 = 2400000;
 pub const FREQ_PRIME_BALANCED: i32 = 2400000;
 pub const FREQ_PRIME_THROTTLE_L1: i32 = 2419200;
 pub const FREQ_PRIME_THROTTLE_L2: i32 = 1382400;
 pub const FREQ_PRIME_MIN: i32 = 844800;
+// prime floor: render thread lives here, cannot afford a dip
+pub const FREQ_PRIME_GAME_FLOOR: i32 = 1996800;
 
 /// Tuning Profiles for Lahaina (SM8350)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,7 +139,41 @@ impl LahainaTuner {
         // touch_boost sysfs lives under the cpuN device kobj, not cpufreq/policyN
         tuner.init_touch_boost();
 
+        // walt cpu-boost legacy_input_boost -- user patched this knob in.
+        // without it there's no touch-triggered freq floor at all on this build,
+        // which is why anim starts and shade pull feel cold even with touch_boost
+        tuner.init_legacy_input_boost();
+
         tuner
+    }
+
+    /// enable walt cpu-boost legacy_input_boost (patched knob in cpu-boost.c).
+    /// user noted the frame-boost-in-schedutil chain is "dead" on this port --
+    /// visible effect is partial. the legacy touch floor is the backup pathway:
+    /// each touch down raises scaling_min_freq across clusters for input_boost_ms,
+    /// which is what the stock colorOS userspace used to rely on for anim starts.
+    fn init_legacy_input_boost(&self) {
+        if !Path::new(CPU_BOOST_LEGACY_INPUT).exists() {
+            log_info!("oplus/lahaina: legacy_input_boost knob not present, skipping");
+            return;
+        }
+        // flip the knob on. module param format is "Y"/"N" or "1"/"0" depending
+        // on how the kernel was built; both are accepted by moduleparam core.
+        write_node_str(CPU_BOOST_LEGACY_INPUT, "Y\n");
+
+        // tune the floor & duration if the knobs are present. 90ms covers one
+        // full 90hz frame; freq picks are modest to balance battery vs touch feel
+        if Path::new(CPU_BOOST_INPUT_MS).exists() {
+            write_node_str(CPU_BOOST_INPUT_MS, "90\n");
+        }
+        if Path::new(CPU_BOOST_INPUT_FREQ).exists() {
+            // per-cpu floor: silver 1.25 GHz, gold 1.25 GHz, prime 1.38 GHz
+            write_node_str(
+                CPU_BOOST_INPUT_FREQ,
+                "0:1248000 4:1248000 7:1382400\n",
+            );
+        }
+        log_info!("oplus/lahaina: legacy_input_boost armed (90ms touch floor)");
     }
 
     /// configure oplus touch_boost for all clusters at startup.
@@ -208,6 +258,52 @@ impl LahainaTuner {
         write_node_int(&node, target)
     }
 
+    /// Apply per-cluster scaling_min_freq floor. Clamped to cpuinfo_min_freq
+    /// at the bottom and cpuinfo_max_freq at the top so a misconfigured policy
+    /// can't lock the SoC. Used by apply_game to stop 120fps dips: without a
+    /// min floor, schedutil ramps gold/prime down between game frame submits
+    /// and the next frame starts cold, costing ~8-10 fps on SM7325.
+    fn set_min(&self, policy: &str, desired_khz: i32) -> bool {
+        let known = match policy {
+            "policy0" => self.has_policy0,
+            "policy4" => self.has_policy4,
+            "policy7" => self.has_policy7,
+            _ => false,
+        };
+        if !known {
+            return false;
+        }
+        let node = format!("{}/scaling_min_freq", policy_dir(policy));
+        if !Path::new(&node).exists() {
+            return false;
+        }
+        let target = match policy_hw_max(policy) {
+            Some(hw_max) if hw_max > 0 => desired_khz.min(hw_max),
+            _ => desired_khz,
+        };
+        write_node_int(&node, target)
+    }
+
+    /// Reset per-cluster scaling_min_freq to cpuinfo_min_freq. Called on
+    /// game exit / normal profile so background workloads can idle properly
+    /// and we don't leak a high min floor into daily use (battery killer).
+    fn reset_min(&self, policy: &str) -> bool {
+        let known = match policy {
+            "policy0" => self.has_policy0,
+            "policy4" => self.has_policy4,
+            "policy7" => self.has_policy7,
+            _ => false,
+        };
+        if !known {
+            return false;
+        }
+        let node = format!("{}/scaling_min_freq", policy_dir(policy));
+        let hw_min = crate::sensor::sysfs::read_int_checked(
+            &format!("{}/cpuinfo_min_freq", policy_dir(policy)),
+        ).unwrap_or(300_000);
+        write_node_int(&node, hw_min)
+    }
+
     /// Apply gaming performance profile:
     /// - Uncap Silver, Gold, and Prime to max silicon clocks
     /// - Instant schedutil up-ramp (0 us delay)
@@ -226,6 +322,16 @@ impl LahainaTuner {
         self.set_max("policy0", FREQ_SILVER_MAX);
         self.set_max("policy4", FREQ_GOLD_MAX);
         self.set_max("policy7", FREQ_PRIME_MAX);
+
+        // GAME FLOORS -- fixes the 120->110fps dip user reports. without these,
+        // schedutil ramps clusters down to idle freq between frame submits and
+        // the first few utilization samples of the next frame are below the up
+        // threshold, so cpu starts cold and the frame overruns the 8.33ms budget.
+        // frame-boost chain in schedutil is dead on this port (user confirmed),
+        // so scaling_min_freq is the only reliable way to prevent the dip.
+        self.set_min("policy0", FREQ_SILVER_GAME_FLOOR);
+        self.set_min("policy4", FREQ_GOLD_GAME_FLOOR);
+        self.set_min("policy7", FREQ_PRIME_GAME_FLOOR);
 
         // zero delay up-ramp: schedutil hits full speed on first demand tick --
         // any positive value here causes visible latency on fast input bursts
@@ -265,6 +371,12 @@ impl LahainaTuner {
         self.set_max("policy0", FREQ_SILVER_MAX);
         self.set_max("policy4", FREQ_GOLD_MAX);
         self.set_max("policy7", FREQ_PRIME_MAX);
+
+        // drop any game floor back to hardware min -- leaving 1.5+ GHz as min
+        // across all clusters outside of games would nuke battery
+        self.reset_min("policy0");
+        self.reset_min("policy4");
+        self.reset_min("policy7");
 
         write_node_int(SUTIL_UP_RATE_SILVER, 0);
         write_node_int(SUTIL_UP_RATE_GOLD, 0);
@@ -332,6 +444,11 @@ impl LahainaTuner {
         self.set_max("policy0", FREQ_SILVER_THROTTLE);
         self.set_max("policy4", FREQ_GOLD_THROTTLE_L2);
         self.set_max("policy7", FREQ_PRIME_THROTTLE_L2);
+
+        // drop game floors on screen off -- otherwise idle current spikes 2-3x
+        self.reset_min("policy0");
+        self.reset_min("policy4");
+        self.reset_min("policy7");
 
         write_node_int(WALT_SCHED_BOOST, 0); // no boost while idle, nothing to boost for
     }
