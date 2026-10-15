@@ -135,8 +135,23 @@ impl SafetyMonitor {
     fn any_battery_sensor_over(sensors: &[Sensor], threshold: i32) -> bool {
         sensors.iter().any(|s| {
             let name = s.name.to_lowercase();
-            name == "battery"
+            (name == "battery" || name == "battery_temp")
                 && s.last_temp_mc.load(Ordering::Relaxed) > threshold
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn battery_power_supply_sensor_can_veto_high_performance() {
+        let sensor = Sensor::new("battery_temp");
+        let monitor = SafetyMonitor::new();
+        sensor.last_temp_mc.store(31000, Ordering::Relaxed);
+        assert!(monitor.is_action_safe(9, std::slice::from_ref(&sensor)));
+        sensor.last_temp_mc.store(39000, Ordering::Relaxed);
+        assert!(!monitor.is_action_safe(9, std::slice::from_ref(&sensor)));
+        assert!(monitor.is_action_safe(1, std::slice::from_ref(&sensor)));
     }
 }

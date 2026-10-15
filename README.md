@@ -309,3 +309,26 @@ OEM thermal configs live in `/data/vendor/thermal/config/` (or `/vendor/etc/`, `
 | `/sys/devices/system/cpu/cpufreq/policy*/scaling_max_freq` | Discovered CPU frequency targets |
 | `/sys/class/power_supply/battery/constant_charge_current` | Charge current target |
 | `/sys/class/thermal/thermal_message/sconfig` | Thermal profile ID (instant workload detection + scenario selection) |
+
+
+### Local UI pacing changes (2026-10-15)
+
+For screen-on Idle/Light/Moderate use, Compute selects a deterministic ceiling
+(action 9 below 75°C CPU, action 6 above it), rather than exploring random CPU
+ceilings. CPU/battery safety checks, the battery temperature ladder, boot limits
+and screen-off limits are applied afterwards. This changes maximum permitted
+frequency, not minimum frequency: schedutil can still downclock and idle.
+
+GPU UI cooling uses the same bounded action as Compute; discovery accepts the
+standard `/sys/class/thermal/cooling_device*` path. The vendor global thermal
+boost stays off for ordinary UI use. Games retain their separate policy.
+Battery power_supply temperatures are converted from deci°C to m°C for the
+learning/safety input. CPU policy discovery uses `/sys/devices/system/cpu/cpufreq`.
+Action history now records the actions after workload ceilings are applied.
+
+These changes are experimental. Fourteen host tests and Android cross compilation
+passed. On Renoir, the binary started and traces confirmed removal of the low CPU
+ceilings and correct battery scaling. Frame misses remained variable (26/597 and
+94/580 on two settled runs), so this does not establish a complete animation fix.
+The old installed binary was backed up. Upgrading from that unknown build also
+includes upstream changes through 801f488.

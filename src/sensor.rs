@@ -51,10 +51,16 @@ pub mod sysfs {
     }
 }
 
+// power_supply temperature ABI is tenths of a degree; thermal zones use m°C.
+fn normalize_sensor_value(path: &str, value: i32) -> i32 {
+    if path == "/sys/class/power_supply/battery/temp" { value.saturating_mul(100) } else { value }
+}
+
 impl Sensor {
     pub fn poll(&self) -> i32 {
         match sysfs::read_int_checked(&self.path) {
             Some(v) => {
+                let v = normalize_sensor_value(&self.path, v);
                 self.last_temp_mc.store(v, Ordering::Relaxed);
                 log_debug!("sensor poll: {} ({}) = {}", self.name, self.path, v);
                 v
@@ -118,7 +124,7 @@ impl EngineDiscovery {
             s.poll_ms = MI_POLL_INTERVAL_MS_DEFAULT;
             let init_v = sysfs::read_int_checked(&es.path);
             if let Some(v) = init_v {
-                s.last_temp_mc.store(v, Ordering::Relaxed);
+                s.last_temp_mc.store(normalize_sensor_value(es.path, v), Ordering::Relaxed);
             }
             log_info!("discovered extra sensor {} initial={:?}", es.name, init_v);
             sensors.push(s);
@@ -134,5 +140,17 @@ impl EngineDiscovery {
 
     pub fn read_sconfig_idx() -> i32 {
         sysfs::read_int("/sys/class/thermal/thermal_message/sconfig")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn battery_abi_units_are_converted_without_changing_other_sensors() {
+        assert_eq!(normalize_sensor_value("/sys/class/power_supply/battery/temp", 310), 31000);
+        assert_eq!(normalize_sensor_value("/sys/class/power_supply/battery/temp", -50), -5000);
+        assert_eq!(normalize_sensor_value("/sys/class/power_supply/battery/current_now", -250000), -250000);
+        assert_eq!(normalize_sensor_value("/sys/class/thermal/thermal_zone1/temp", 43000), 43000);
     }
 }

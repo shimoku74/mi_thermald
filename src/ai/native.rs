@@ -59,17 +59,36 @@ fn action_for_battery_temp(workload_mode: WorkloadMode, batt_temp_c: f32) -> u8 
         .map_or(0, |&(_, action)| action)
 }
 
-fn interactive_compute_floor(mode: WorkloadMode, screen_on: bool, cpu_temp_normalized: f32) -> Option<u8> {
-    if !screen_on || cpu_temp_normalized >= 0.75 {
-        return None;
+// UI bursts are shorter than the one-second thermal tick. An aggregate CPU
+// load of <10% can still contain a saturated UI thread on an eight-core SoC.
+fn is_interactive_ui(mode: WorkloadMode, screen_on: bool) -> bool {
+    screen_on && matches!(mode, WorkloadMode::Idle | WorkloadMode::Light | WorkloadMode::Moderate)
+}
+
+fn compute_action(proposed: u8, mode: WorkloadMode, screen_on: bool,
+                  cpu_temp: f32, boot: bool, post_boot: bool, heavy: bool) -> u8 {
+    if boot { return proposed.min(BOOT_MAX_ACTION); }
+    if post_boot { return proposed; }
+    if is_interactive_ui(mode, screen_on) {
+        // This is a ceiling, not a frequency floor. schedutil remains free to
+        // idle/downclock; battery and safety checks run after this selection.
+        return if cpu_temp < 0.75 { 9 } else { 6 };
     }
-    Some(match mode {
-        WorkloadMode::Idle => 3,
-        WorkloadMode::Light => 6,
-        WorkloadMode::Moderate => 7,
-        WorkloadMode::Gaming | WorkloadMode::PerfGaming => 7,
-        WorkloadMode::Benchmark => 8,
-    })
+    if heavy { return proposed.max(if mode == WorkloadMode::Benchmark { 9 } else { 8 }); }
+    proposed
+}
+
+fn workload_ceiling(group: ChannelGroup, mode: WorkloadMode, screen_on: bool) -> u8 {
+    if !screen_on {
+        return match group { ChannelGroup::Compute => 2, ChannelGroup::Thermal => 1, _ => 9 };
+    }
+    match (group, mode) {
+        (ChannelGroup::Compute, WorkloadMode::Idle | WorkloadMode::Light | WorkloadMode::Moderate) => 9,
+        (ChannelGroup::Thermal, WorkloadMode::Idle) => 3,
+        (ChannelGroup::Thermal, WorkloadMode::Light) => 7,
+        (_, WorkloadMode::Gaming | WorkloadMode::PerfGaming) => 8,
+        _ => 9,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -285,7 +304,7 @@ impl NativeController {
             self.disabled_reason = None;
         }
 
-        let (mut group_actions, state, prev_state, prev_actions) = {
+        let (group_actions, state, prev_state, prev_actions) = {
             let model = self.scenario_models
                 .entry(self.current_scenario)
                 .or_insert_with(ScenarioModel::new);
@@ -375,40 +394,25 @@ impl NativeController {
             let mut group_actions = HashMap::new();
             for &group in &[ChannelGroup::Compute, ChannelGroup::Thermal, ChannelGroup::Charging, ChannelGroup::Display] {
                 let q_table = model.q_tables.entry(group).or_insert_with(QTable::new);
-                let action = q_table.select_action(&state_array);
-                let safe = self.safety_monitor.is_action_safe(action, sensor_readings);
-                let mut final_action = if safe { action } else { 3u8 };
+                let proposed = q_table.select_action(&state_array);
+                let mut final_action = if group == ChannelGroup::Compute {
+                    compute_action(proposed, workload_mode, state.screen_on > 0.5,
+                                   state.t_cpu_max, in_boot_phase, in_post_boot, is_heavy_load)
+                } else if in_boot_phase {
+                    proposed.min(BOOT_MAX_ACTION)
+                } else { proposed };
 
-                if in_boot_phase {
-                    final_action = final_action.min(BOOT_MAX_ACTION);
-                } else if !in_post_boot && group == ChannelGroup::Compute {
-                    if is_heavy_load {
-                        let sustained_floor = match workload_mode {
-                            crate::ai::WorkloadMode::Benchmark => 9,
-                            crate::ai::WorkloadMode::Gaming
-                            | crate::ai::WorkloadMode::PerfGaming => 8,
-                            _ => 8,
-                        };
-                        final_action = final_action.max(sustained_floor);
-                    } else if safe {
-                        // An untrained Q-table explores all actions, including
-                        // 30% CPU caps. Keep interactive use responsive while
-                        // the model learns; thermal and battery caps still apply.
-                        if let Some(floor) = interactive_compute_floor(
-                            workload_mode, state.screen_on > 0.5, state.t_cpu_max,
-                        ) {
-                            final_action = final_action.max(floor);
-                        }
-                    }
+                final_action = final_action.min(workload_ceiling(
+                    group, workload_mode, state.screen_on > 0.5));
+                // Check the action actually being applied, including overrides.
+                // A heavy-load hint must never override a thermal veto.
+                if !self.safety_monitor.is_action_safe(final_action, sensor_readings) {
+                    final_action = final_action.min(3);
                 }
-
                 if batt_temp >= 0 {
-                    let temp_action = action_for_battery_temp(workload_mode, batt_temp_c);
-                    if temp_action < final_action {
-                        final_action = temp_action;
-                    }
+                    final_action = final_action.min(action_for_battery_temp(workload_mode, batt_temp_c));
                 }
-                
+
                 group_actions.insert(group, final_action);
             }
 
@@ -449,37 +453,10 @@ impl NativeController {
             (group_actions, state, prev_state, prev_actions)
         };
 
-        // Deterministic workload ceilings — applied after Q-learning and battery
-        // temp ladder so context-obvious choices override exploration noise.
-        let screen_off = state.screen_on < 0.5;
-        let workload_mode_now = self.workload_detector.last_mode_for_caps();
-        for (&group, act) in group_actions.iter_mut() {
-            let ceil: u8 = match (screen_off, workload_mode_now) {
-                (true, _) => match group {
-                    ChannelGroup::Compute => 2,
-                    ChannelGroup::Thermal => 1,
-                    _ => 9,
-                },
-                (false, crate::ai::WorkloadMode::Idle) => match group {
-                    ChannelGroup::Compute => 3,
-                    ChannelGroup::Thermal => 3,
-                    _ => 9,
-                },
-                (false, crate::ai::WorkloadMode::Light) => match group {
-                    ChannelGroup::Compute => 7,
-                    ChannelGroup::Thermal => 7,
-                    _ => 9,
-                },
-                (false, crate::ai::WorkloadMode::Gaming)
-                | (false, crate::ai::WorkloadMode::PerfGaming) => 8,
-                _ => 9,
-            };
-            if *act > ceil {
-                *act = ceil;
-            }
-        }
-
-        self.apply_grouped_actions(&group_actions, sensor_readings);
+        let ui_action = if is_interactive_ui(self.workload_detector.last_mode_for_caps(), state.screen_on > 0.5) {
+            group_actions.get(&ChannelGroup::Compute).copied()
+        } else { None };
+        self.apply_grouped_actions(&group_actions, sensor_readings, ui_action);
 
         if let Some(ref ls) = prev_state {
             let state_array = self.feature_extractor.to_array(ls);
@@ -631,16 +608,17 @@ impl NativeController {
 
         // GPU cooling device via thermal-devfreq-0 (Qualcomm devfreq).
         // cur_state=0 = no cooling = max GPU freq; max_state = max cooling = min freq.
-        'gpu: for search_type in &["thermal-devfreq-0"] {
-            if let Ok(entries) = fs::read_dir("/sys/class/cooling_device") {
+        'gpu: for root in &["/sys/class/thermal", "/sys/class/cooling_device"] {
+            if let Ok(entries) = fs::read_dir(root) {
                 for entry in entries.flatten() {
                     let dev = entry.file_name().to_string_lossy().to_string();
-                    let type_path = format!("/sys/class/cooling_device/{}/type", dev);
+                    if !dev.starts_with("cooling_device") { continue; }
+                    let type_path = format!("{}/{}/type", root, dev);
                     let dev_type = crate::sensor::sysfs::read_string(&type_path)
                         .unwrap_or_default();
-                    if dev_type.trim() == *search_type {
-                        let cur_path = format!("/sys/class/cooling_device/{}/cur_state", dev);
-                        let max_path = format!("/sys/class/cooling_device/{}/max_state", dev);
+                    if dev_type.trim() == "thermal-devfreq-0" {
+                        let cur_path = format!("{}/{}/cur_state", root, dev);
+                        let max_path = format!("{}/{}/max_state", root, dev);
                         let max_val = crate::sensor::sysfs::read_int(&max_path).max(1);
                         let cur_val = crate::sensor::sysfs::read_int(&cur_path).max(0);
                         self.channels.push(CoolingChannel {
@@ -655,7 +633,7 @@ impl NativeController {
                             pid_state: SicState::default(),
                             sensor_name: None,
                         });
-                        log_info!("AI-native: GPU channel {} ({}) max_state={}", dev, search_type, max_val);
+                        log_info!("AI-native: GPU channel {} ({}) max_state={}", dev, "thermal-devfreq-0", max_val);
                         break 'gpu;
                     }
                 }
@@ -723,9 +701,12 @@ impl NativeController {
         self.apply_temp_based_charge();
     }
 
-    fn apply_grouped_actions(&mut self, actions: &HashMap<ChannelGroup, u8>, sensors: &[Sensor]) {
+    fn apply_grouped_actions(&mut self, actions: &HashMap<ChannelGroup, u8>, sensors: &[Sensor], ui_action: Option<u8>) {
         for ch in &mut self.channels {
-            let action = *actions.get(&ch.group).unwrap_or(&9);
+            let group_action = *actions.get(&ch.group).unwrap_or(&9);
+            // GPU composition must not inherit random idle cooling while the
+            // CPU policy permits a UI burst. Reuse its already checked ceiling.
+            let action = if ch.name == "gpu" { ui_action.unwrap_or(group_action) } else { group_action };
 
             if let Some(ref pid) = ch.pid {
                 let setpoint = Self::action_to_setpoint(action, pid);
@@ -747,7 +728,9 @@ impl NativeController {
                 continue;
             }
             if ch.name == "boost" {
-                let boost_val = Self::action_to_channel_value(action, ch);
+                // Opening the CPU ceiling must not hold the vendor's global
+                // thermal boost on continuously during ordinary screen-on use.
+                let boost_val = if ui_action.is_some() { 0 } else { Self::action_to_channel_value(action, ch) };
                 if boost_val != ch.value && crate::sensor::sysfs::write_int(&ch.path, boost_val) {
                     ch.value = boost_val;
                 }
@@ -995,12 +978,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn interactive_floor_preserves_thermal_headroom_rule() {
-        assert_eq!(interactive_compute_floor(WorkloadMode::Light, true, 0.5), Some(6));
-        assert_eq!(interactive_compute_floor(WorkloadMode::Moderate, true, 0.5), Some(7));
-        assert_eq!(interactive_compute_floor(WorkloadMode::Gaming, true, 0.5), Some(7));
-        assert_eq!(interactive_compute_floor(WorkloadMode::Light, false, 0.5), None);
-        assert_eq!(interactive_compute_floor(WorkloadMode::Light, true, 0.75), None);
+    fn ui_ceiling_is_deterministic_and_does_not_use_aggregate_idle() {
+        for mode in [WorkloadMode::Idle, WorkloadMode::Light, WorkloadMode::Moderate] {
+            for proposed in 0..=9 {
+                let chosen = compute_action(proposed, mode, true, 0.4, false, false, false);
+                assert_eq!(chosen.min(workload_ceiling(ChannelGroup::Compute, mode, true)), 9);
+                assert_eq!(compute_action(proposed, mode, true, 0.76, false, false, true), 6);
+            }
+        }
+    }
+
+    #[test]
+    fn ui_does_not_bypass_boot_screen_off_or_battery_ceiling() {
+        assert_eq!(compute_action(9, WorkloadMode::Light, true, 0.4, true, false, false), 4);
+        assert_eq!(compute_action(2, WorkloadMode::Light, true, 0.4, false, true, false), 2);
+        assert_eq!(workload_ceiling(ChannelGroup::Compute, WorkloadMode::Idle, false), 2);
+        let ui = compute_action(0, WorkloadMode::Light, true, 0.4, false, false, false);
+        assert_eq!(ui.min(action_for_battery_temp(WorkloadMode::Light, 40.5)), 4);
     }
 
     #[test]

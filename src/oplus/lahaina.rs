@@ -97,7 +97,7 @@ pub struct LahainaTuner {
 }
 
 fn policy_dir(policy: &str) -> String {
-    format!("/sys/devices/system/cpu/{}/cpufreq", policy)
+    format!("/sys/devices/system/cpu/cpufreq/{}", policy)
 }
 
 fn policy_max_node(policy: &str) -> String {
